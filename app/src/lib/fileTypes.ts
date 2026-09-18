@@ -28,7 +28,14 @@ import {
  * Office formats the scraper stores as themselves plus a derived sibling PDF
  * ("deck.pptx" → "deck.pptx.pdf"). Mirrors OFFICE_EXTS in paths.rs.
  */
-export const OFFICE_EXTS = ["pptx", "docx", "ppt", "doc"];
+export const OFFICE_EXTS = ["pptx", "docx", "xlsx", "ppt", "doc", "xls"];
+
+/**
+ * The same set as a SQL list, for the queries that select the files the
+ * PDF pipeline owns (`lower(file_type) IN …`). Built from OFFICE_EXTS so a new
+ * format reaches the parse sweep and the embed queue by being added once.
+ */
+export const PDF_BACKED_SQL_LIST = `('pdf', ${OFFICE_EXTS.map((e) => `'${e}'`).join(", ")})`;
 
 function ext(filename: string): string {
   const i = filename.lastIndexOf(".");
@@ -72,7 +79,7 @@ export function parsedMdRelPath(file: { filename: string; relative_path: string 
 /**
  * The icon a file wears in a list that mixes categories, matching the glyph its
  * own subject tab uses — a page is a `FileText`, an announcement a `Megaphone`,
- * a downloaded artefact whatever its extension says. Only downloads carry a
+ * a downloaded artefact whatever its extension says. Downloads and uploads carry a
  * meaningful extension, which is why `fileIconFor` is the fallback and not the
  * rule.
  */
@@ -87,6 +94,7 @@ export function categoryIconFor(file: {
     case "ed": return ChatsCircle;
     case "module": return Stack;
     case "file":
+    case "upload":
     case "image": return fileIconFor(file.filename);
     default: return FileText;
   }

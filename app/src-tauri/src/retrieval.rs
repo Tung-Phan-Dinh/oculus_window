@@ -111,8 +111,9 @@ fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
 /// second reader is harmless, and our writes are occasional (once per file
 /// embedded), so a busy timeout is enough to stay out of the plugin's way.
 pub async fn pool(path: &Path) -> Result<SqlitePool, String> {
+    let path = crate::database::resolve_path(path)?;
     let opts = SqliteConnectOptions::new()
-        .filename(path)
+        .filename(&path)
         .create_if_missing(false)
         .busy_timeout(Duration::from_secs(15));
     SqlitePoolOptions::new()

@@ -4,6 +4,13 @@ One Rust engine scrapes three services. It runs identically inside the app
 (on a plain thread, reporting through Tauri events) and in the `oculus` CLI
 (reporting to stdout).
 
+Windows uses the same engine and `/`-separated library paths. Native filesystem
+paths are constructed only when opening an artifact. Office conversion in
+`app/src-tauri/src/sync.rs` discovers LibreOffice from `OCULUS_SOFFICE`, PATH,
+or the standard Program Files locations and launches it without a console
+window. LibreOffice is an optional external installation; a missing converter
+is reported by the existing conversion error path.
+
 ## Where
 
 | Piece | Location |
@@ -17,12 +24,23 @@ One Rust engine scrapes three services. It runs identically inside the app
 | App-side entry: thread + `AppReporter` | `app/src-tauri/src/scrape.rs` |
 | Headless DB writes | `app/src-tauri/src/store.rs` |
 | Subject list state | `app/src-tauri/src/subjects.rs` |
+| Chronological term ranking | `app/src-tauri/src/terms.rs` |
+| Personal subject file import and deletion | `app/src-tauri/src/files.rs` |
 | Agent docs written into the library | `app/src-tauri/src/agents.rs` |
 | Canvas calendar (class times, due dates) | `app/src-tauri/src/calendar.rs` |
 | Frontend sync page / runner | `app/src/pages/SyncPage.tsx`, `app/src/lib/syncRunner.ts` |
 
 ## How it connects
 
+- **The current term is ranked, not compared as text.** `list_courses` marks
+  the newest term that still has available courses as current, and that flag
+  is what `oculus run` syncs by default, what `oculus list` marks, and what a
+  search with no named subject falls back to. Canvas term names do not sort
+  chronologically — `"2026 Summer Term"` beats `"2026 Semester 2"` as a
+  string while starting six months earlier — so `app/src-tauri/src/terms.rs`
+  ranks the term within its year (summer, semester 1, winter, semester 2).
+  Before that, one summer enrolment marked a whole year of real subjects as
+  past, and a default CLI sync fetched the summer subject alone.
 - **Modules are the driver.** The engine walks each course's modules and
   fetches pages and files through them, so nothing is downloaded twice. It
   was ported line-for-line in strategy from the old `scraper.js` (hidden
@@ -64,15 +82,74 @@ One Rust engine scrapes three services. It runs identically inside the app
   are always re-fetched and re-generated — the byte-compare in
   `paths::write_course_bytes` is what decides new/updated/unchanged, so e.g.
   a changed submission status still lands. "Re-download" bypasses the skip.
+- **Office documents are stored as themselves plus a derived PDF.** Everything
+  downstream — the parsers, the page-image embedder, the viewer — is
+  PDF-shaped, so `.pptx/.docx/.xlsx/.ppt/.doc/.xls` are downloaded intact and
+  LibreOffice headless writes `deck.pptx.pdf` beside the original
+  (`office_to_pdf` in `app/src-tauri/src/sync.rs`). The derived PDF is never
+  announced and never gets a `files` row — the original name is the library
+  row, which is what `paths::doc_pdf_rel` resolves for every consumer.
+  Migration 10 in `app/src-tauri/src/lib.rs` exists because those PDFs once
+  did get rows. **With LibreOffice absent the original is still stored**, the
+  run logs a warning, and the file stays out of `file-manifest.json` so the
+  next sync retries the conversion rather than skipping it. `office_to_pdf`
+  and `office_ext_of` are `pub(crate)` for one caller outside this engine:
+  the student's own uploads go through the very same conversion
+  (`app/src-tauri/src/files.rs`, [frontend.md](./frontend.md)), so a dropped
+  `.docx` is searchable on exactly the terms a scraped one is.
+- **A spreadsheet is exported as one page per sheet**, not with Calc's default
+  pagination (`convert_target` in `app/src-tauri/src/sync.rs`). Calc slices a
+  wide sheet into page-width column bands and gives the later bands no
+  headers: a 300-row × 25-column marks sheet exported as 54 pages, of which
+  only the first band carried the ID and name columns — the rest were bare
+  grids of numbers, which is both a meaningless page image and the markdown a
+  citation would hydrate from. `SinglePageSheets` keeps every row with its
+  headers; `MAX_RENDER_PIXELS` in `sidecar/embedder.py` is what stops the
+  resulting page being rendered at its full size.
+- **An untyped upload is judged by its extension.** Canvas reports whatever
+  content type the uploading browser claimed, so the same deck arrives typed
+  on one course and `application/octet-stream` on another. A generic type
+  falls back to the filename (`office_ext_of`), which is still an allowlist —
+  only the extensions the converter handles, plus `.pdf`.
 - **Changed bytes invalidate the parse.** An `updated` write purges the
-  sidecar artifacts (`.md`, `.pages.json`, `.emb.json` — see
+  sidecar artifacts (`.md`, `.pages.json`, `.emb.json` and the page-image folder — see
   `paths::purge_parse_artifacts`), and the app clears the file's stored
   pages and parse/embed statuses, so the pipeline re-runs instead of the
   sidecar's existence checks pinning stale markdown and vectors.
+- **Personal files live in a subject's `uploads/` folder.** `import_uploads`
+  copies picked files into `courses/<code>/uploads/` and returns a result for
+  each pick, so one failure does not discard the other imports. Office files
+  use the same converter as a sync; if conversion fails, the original still
+  gets a library row and a visible warning. Parsing, search and chat then use
+  the same library paths as downloaded course material.
+  Imports preserve identical files and rename different files that share a
+  name. Allocation also reserves converted PDFs, markdown, embedding records
+  and image-folder names, so `notes.md` cannot be overwritten by parsing a
+  later `notes.pdf`. Concurrent imports are serialized and new files are
+  created without overwrite. Names retain the Windows port's device-name and
+  Unicode-length handling.
+- **Only personal uploads can be deleted.** `delete_upload` removes the
+  original, its converted PDF and parse artifacts. Its lexical check accepts
+  only flat, portable upload paths; filesystem checks reject symbolic links
+  and Windows junctions in the subject/upload folders or derived artifacts.
+  Recursive image cleanup resolves its target inside the library first.
+  Deleted names remain reserved by zero-byte markers in the internal
+  `.oculus-upload-reservations/` folder: a parser already running may finish
+  after deletion, and its late output must never become another file's parse.
+  Deletion is safe to retry after the original is gone, so a failed database
+  row deletion does not strand the entry. Every retry repeats the same path
+  checks and removes any parse artifacts that arrived late.
+  A downloaded Canvas file is never eligible for this command.
 - **Progress leaves through a `Reporter` trait**, not a channel to the UI.
   `app/src-tauri/src/scrape.rs` implements it by emitting the same Tauri
   events the frontend already listened for; the CLI implements it by
   printing. The UI contract did not change when the scraper left the WebView.
+- **CLI success requires metadata persistence.** A failed history insert stops
+  the run before scraping. A failed file-row or completion write returns an
+  error and records failed history where the database still permits it; bytes
+  downloaded to disk are retained for the next sync. The CLI's following index
+  phase includes Office originals whose converted siblings are available, as
+  well as native PDFs.
 - `app/src-tauri/src/canvas.rs` is the **entire** Canvas HTTP surface — the
   session cookie, retry policy, and Link-header pagination live only there.
   Both scraping and auth probing go through it.

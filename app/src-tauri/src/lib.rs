@@ -5,6 +5,7 @@ pub mod browser;
 pub mod calendar;
 pub mod canvas;
 pub mod chapters;
+pub mod database;
 pub mod echo360;
 pub mod ed;
 mod files;
@@ -19,12 +20,15 @@ pub mod okta;
 mod media;
 pub mod mineru;
 pub mod paths;
+pub mod platform;
+mod python_runtime;
 pub mod projects;
 pub mod recap;
 pub mod retrieval;
 mod scrape;
 pub mod store;
 pub mod sync;
+pub mod terms;
 pub mod sidecar;
 mod storage;
 mod subjects;
@@ -39,9 +43,36 @@ use sidecar::SidecarProcess;
 use scrape::ScrapeCancel;
 use subjects::SubjectsState;
 
+struct LibraryDatabaseUrl(Result<String, String>);
+
+#[tauri::command]
+fn library_database_url(location: tauri::State<'_, LibraryDatabaseUrl>) -> Result<String, String> {
+    location.0.clone()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    // Every SQLite connection must use the same physical DB filename on
+    // Windows. MSIX can redirect this one file without redirecting its parent.
+    #[cfg(windows)]
+    let database_url = database::plugin_url(&paths::db_path(&paths::data_dir()));
+    #[cfg(not(windows))]
+    let database_url: Result<String, String> = Ok("sqlite:oculus.db".into());
+    if let Err(error) = &database_url { eprintln!("[oculus] database: {error}"); }
+    // On failure the command returns the actionable error; this unused key
+    // never opens a fallback database or silently loses the user's library.
+    let migration_url = database_url.clone().unwrap_or_else(|_| "sqlite:oculus-unavailable".into());
+    let builder = tauri::Builder::default();
+    #[cfg(windows)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
+        if let Some(window) = app.get_webview_window("main") {
+            window.show().ok();
+            window.unminimize().ok();
+            window.set_focus().ok();
+        }
+    }));
+    builder
+        .manage(LibraryDatabaseUrl(database_url))
         // ⌘T / ⌘W reach the app as menu events, not key events — see menu.rs.
         .menu(menu::build)
         .on_menu_event(menu::handle)
@@ -160,10 +191,12 @@ pub fn run() {
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
+        // Native file selection returns paths; document bytes stay off IPC.
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_sql::Builder::new()
                 .add_migrations(
-                    "sqlite:oculus.db",
+                    &migration_url,
                     vec![
                         tauri_plugin_sql::Migration {
                             version: 1,
@@ -1066,6 +1099,7 @@ ALTER TABLE projects ADD COLUMN event_id TEXT;
                 .build(),
         )
         .invoke_handler(tauri::generate_handler![
+            library_database_url,
             auth::get_auth_status,
             auth::check_canvas_session,
             auth::launch_canvas_auth,
@@ -1086,6 +1120,8 @@ ALTER TABLE projects ADD COLUMN event_id TEXT;
             files::read_course_file,
             files::open_course_file,
             files::scan_parsed_files,
+            files::import_uploads,
+            files::delete_upload,
             calendar::calendar_sync_events,
             lectures::echo360_sync_lectures,
             lectures::echo360_download_video,

@@ -21,6 +21,7 @@ import {
   parseUsage,
 } from "@/lib/harness";
 import { itemsFor, useHarnessStore } from "@/stores/harnessStore";
+import { shortcut } from "@/lib/platform";
 
 const SUGGESTIONS = [
   "What's due this week?",
@@ -304,7 +305,7 @@ export default function ChatPage() {
               variant="ghost"
               size="icon-xs"
               aria-label="Show conversations"
-              title="Show conversations (⌘⌥B)"
+              title={`Show conversations (${shortcut("B", true)})`}
               className="-ml-2 shrink-0 text-muted-foreground"
               onClick={list.toggle}
             >

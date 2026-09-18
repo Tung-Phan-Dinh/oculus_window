@@ -16,6 +16,8 @@ export interface PickerProvider {
   models: HarnessModel[];
   /** The list is still being fetched — Codex asks its own CLI for one. */
   loading?: boolean;
+  /** A bridge is not ready; retain the row and selection for a later recheck. */
+  unavailableReason?: string;
 }
 
 /**
@@ -63,7 +65,7 @@ export function ModelPicker({
   const searchRef = useRef<HTMLInputElement>(null);
 
   const active = providers.find((p) => p.id === provider) ?? providers[0];
-  const models = active?.models ?? [];
+  const models = active?.unavailableReason ? [] : active?.models ?? [];
   const selected = models.find((m) => m.id === model) ?? null;
 
   // A stale search would silently hide rows the next time the menu opens.
@@ -90,7 +92,7 @@ export function ModelPicker({
   // pretending nothing is selected.
   const label = selected?.label ?? model;
   const levelText = level ? reasoningLabel(level) : null;
-  const title = [active?.label, selected?.id ?? model, levelText && `${levelText} reasoning`]
+  const title = [active?.label, selected?.id ?? model, active?.unavailableReason, levelText && `${levelText} reasoning`]
     .filter(Boolean)
     .join(" · ");
 
@@ -134,8 +136,9 @@ export function ModelPicker({
                 <button
                   key={p.id}
                   type="button"
-                  title={providerLocked && !isActive ? `${p.label} — start a new chat to switch` : p.label}
-                  disabled={providerLocked && !isActive}
+                  aria-label={p.label}
+                  title={p.unavailableReason ?? (providerLocked && !isActive ? `${p.label} — start a new chat to switch` : p.label)}
+                  disabled={!!p.unavailableReason || (providerLocked && !isActive)}
                   onMouseDown={(e) => e.preventDefault()}
                   onClick={() => {
                     if (p.id !== provider) onProvider(p.id);
@@ -171,7 +174,9 @@ export function ModelPicker({
         <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-1 pb-1">
           <SectionLabel>Model</SectionLabel>
 
-          {active?.loading ? (
+          {active?.unavailableReason ? (
+            <div className="px-2 py-1.5 text-xs text-muted-foreground">{active.unavailableReason}</div>
+          ) : active?.loading ? (
             <div className="px-2 py-1.5 text-xs text-muted-foreground">Loading models…</div>
           ) : filtered.length === 0 ? (
             <div className="px-2 py-1.5 text-xs text-muted-foreground">

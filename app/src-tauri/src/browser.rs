@@ -196,7 +196,34 @@ pub fn seed_canvas_session(app: &AppHandle) {
     .ok();
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn seed_windows_cookies(page: &Webview<tauri::Wry>, header: &str) -> Result<(), String> {
+    for part in header.split(';') {
+        let Some((name, value)) = part.trim().split_once('=') else { continue };
+        if name.is_empty() { continue; }
+        let cookie = tauri::webview::Cookie::build((name.to_owned(), value.to_owned()))
+            .domain(CANVAS_HOST).path("/").secure(true)
+            .http_only(name == "canvas_session").build();
+        page.set_cookie(cookie).map_err(|e| format!("restore Canvas browser session: {e}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub fn seed_canvas_session(app: &AppHandle) {
+    let header = crate::auth::saved_cookie_header(app);
+    let page = app.webviews().into_iter()
+        .find(|(label, _)| label.starts_with(LABEL_PREFIX) || label == "canvas-auth")
+        .map(|(_, page)| page);
+    if let Some(page) = page {
+        // WebView2 cookie operations must stay off its event-loop thread.
+        std::thread::spawn(move || {
+            if let Err(e) = seed_windows_cookies(&page, &header) { eprintln!("[oculus] {e}"); }
+        });
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn seed_canvas_session(_app: &AppHandle) {}
 
 // ── Layout ──────────────────────────────────────────────────────────────
@@ -205,6 +232,10 @@ pub fn seed_canvas_session(_app: &AppHandle) {}
 /// the window without a round trip through JavaScript. From `setup`, once
 /// the config windows exist.
 pub fn init(app: &AppHandle) {
+    #[cfg(target_os = "windows")]
+    if let Some(main) = app.get_webview(MAIN) {
+        crate::menu::attach_windows_accelerators(&main);
+    }
     seed_canvas_session(app);
     let Some(window) = app.get_window(MAIN) else {
         eprintln!("[oculus] browser: no main window at setup; pages will not follow resizes");
@@ -356,13 +387,18 @@ fn create_page(app: &AppHandle, id: u32, url: url::Url) -> Result<(), String> {
     let load_app = app.clone();
     let title_app = app.clone();
     let popup_app = app.clone();
-    let builder = WebviewBuilder::new(label(id), WebviewUrl::External(url))
+    #[cfg(target_os = "windows")]
+    let start_url = url::Url::parse("about:blank").expect("static URL");
+    #[cfg(not(target_os = "windows"))]
+    let start_url = url.clone();
+    let builder = WebviewBuilder::new(label(id), WebviewUrl::External(start_url))
         // Page-load events, not `on_navigation`, are what the tab follows:
         // `on_navigation` fires for every frame, and a Canvas dashboard is a
         // nest of iframes — the tab would end up pointed at an LTI
         // postMessage shim seconds after landing on the page you asked for.
         // These come from WebKit's navigation delegate, main frame only.
         .on_page_load(move |webview, payload| {
+            if payload.url().scheme() == "about" { return; }
             let started = matches!(payload.event(), PageLoadEvent::Started);
             let url = payload.url().to_string();
             with_state(&load_app, |s| {
@@ -377,7 +413,8 @@ fn create_page(app: &AppHandle, id: u32, url: url::Url) -> Result<(), String> {
             // A Canvas page load rolls the session forward; the cookie the
             // scraper replays is a snapshot, so take a fresh one.
             if !started && payload.url().host_str() == Some(CANVAS_HOST) {
-                crate::auth::save_session_cookie(webview.app_handle());
+                let app = webview.app_handle().clone();
+                std::thread::spawn(move || crate::auth::save_session_cookie(&app));
             }
         })
         .on_document_title_changed(move |_, title| {
@@ -395,6 +432,9 @@ fn create_page(app: &AppHandle, id: u32, url: url::Url) -> Result<(), String> {
         .on_new_window(move |url, _| {
             let app = popup_app.clone();
             std::thread::spawn(move || {
+                #[cfg(target_os = "windows")]
+                open_tab(&app, url).ok();
+                #[cfg(not(target_os = "windows"))]
                 app.clone()
                     .run_on_main_thread(move || {
                         open_tab(&app, url).ok();
@@ -404,15 +444,36 @@ fn create_page(app: &AppHandle, id: u32, url: url::Url) -> Result<(), String> {
             NewWindowResponse::Deny
         });
 
+    // WebView2 honors data_directory (WKWebView does not). Login and all
+    // browser tabs must share one profile, isolated from the privileged UI.
+    #[cfg(target_os = "windows")]
+    let builder = builder.data_directory(crate::auth::canvas_session_dir(app));
+
     let viewport = with_state(app, |s| s.viewports.get(&id).copied());
     let (position, size, radius) = rect(content_size(&window), viewport);
     let webview = window
         .add_child(builder, position, size)
         .map_err(|e| format!("failed to open page webview: {e}"))?;
+    #[cfg(target_os = "windows")]
+    crate::menu::attach_windows_accelerators(&webview);
     // Commands run on the main thread, so nothing paints between the view
     // appearing and this: it is hidden before its first frame.
     webview.hide().ok();
     round_corners(&webview, radius);
+    #[cfg(target_os = "windows")]
+    {
+        let header = crate::auth::saved_cookie_header(app);
+        std::thread::spawn(move || {
+            // Restore HttpOnly session cookies before the first request,
+            // including after a cold launch or headless Okta recovery.
+            if let Err(e) = seed_windows_cookies(&webview, &header) {
+                eprintln!("[oculus] {e}");
+            }
+            if let Err(e) = webview.navigate(url) {
+                eprintln!("[oculus] browser navigation failed: {e}");
+            }
+        });
+    }
     Ok(())
 }
 
@@ -449,7 +510,7 @@ pub fn open_tab(app: &AppHandle, url: url::Url) -> Result<u32, String> {
 
 /// Open an external link. Returns the new tab's id.
 #[tauri::command]
-pub fn browser_open_url(app: AppHandle, url: String) -> Result<u32, String> {
+pub async fn browser_open_url(app: AppHandle, url: String) -> Result<u32, String> {
     open_tab(&app, parse(&url)?)
 }
 
@@ -505,11 +566,14 @@ pub fn browser_hide(app: AppHandle) {
 /// The address bar. Always navigates, even to the same URL — typing an
 /// address and hitting return should reload it.
 #[tauri::command]
-pub fn browser_navigate(app: AppHandle, id: u32, url: String) -> Result<(), String> {
+pub async fn browser_navigate(app: AppHandle, id: u32, url: String) -> Result<(), String> {
     let target = parse(&url)?;
     let webview = page(&app, id).ok_or("no such tab")?;
     if target.host_str() == Some(CANVAS_HOST) {
+        #[cfg(not(target_os = "windows"))]
         seed_canvas_session(&app);
+        #[cfg(target_os = "windows")]
+        seed_windows_cookies(&webview, &crate::auth::saved_cookie_header(&app))?;
     }
     webview.navigate(target).map_err(|e| e.to_string())
 }

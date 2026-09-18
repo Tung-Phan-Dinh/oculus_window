@@ -70,7 +70,7 @@ try {
   execFileSync(
     "cargo",
     ["build", "--release", "--manifest-path", manifest, "--bin", "oculus"],
-    { stdio: "inherit" },
+    { stdio: "inherit", cwd: dirname(manifest), windowsHide: true },
   );
 } catch (e) {
   // Never leave an empty file behind claiming to be the CLI — the next bundle

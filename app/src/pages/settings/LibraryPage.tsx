@@ -68,7 +68,8 @@ export default function SettingsLibraryPage() {
   const [library, setLibrary] = useState<LibraryCounts | null>(null);
   const [indexStats, setIndexStats] = useState<IndexStats | null>(null);
   const [sidecar, setSidecar] = useState<SidecarHealth | null>(null);
-  const [sidecarDown, setSidecarDown] = useState(false);
+  const [sidecarError, setSidecarError] = useState<string | null>(null);
+  const sidecarDown = sidecarError !== null;
   const [settings, setSettings] = useState<ParseSettings>(DEFAULT_PARSE_SETTINGS);
   const [memoryGb, setMemoryGb] = useState(DEFAULT_PARSE_SETTINGS.memoryCapMb / 1024);
   const [hasToken, setHasToken] = useState(false);
@@ -112,10 +113,12 @@ export default function SettingsLibraryPage() {
         const health = await invoke<SidecarHealth>("sidecar_health");
         if (!cancelled) {
           setSidecar(health);
-          setSidecarDown(false);
+          setSidecarError(null);
         }
-      } catch {
-        if (!cancelled) setSidecarDown(true);
+      } catch (error) {
+        if (!cancelled) {
+          setSidecarError(error instanceof Error ? error.message : String(error));
+        }
       }
     };
     poll();
@@ -286,7 +289,7 @@ export default function SettingsLibraryPage() {
               <div>
                 <p className="text-xs text-foreground">MinerU API token</p>
                 <p className="text-[11px] text-muted-foreground">
-                  Stored in your Mac keychain, never in the library database.
+                  Stored in your device's credential store, never in the library database.
                 </p>
               </div>
               {hasToken && !tokenExpired ? (
@@ -341,7 +344,7 @@ export default function SettingsLibraryPage() {
               <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
                 Lecture PDFs are uploaded to MinerU and its PRC-hosted OSS storage. Results may be
                 cached by MinerU (its documented default cache tolerance is 15 minutes, not a deletion guarantee).
-                Use Local only to keep course material on this Mac.
+                Use Local only to keep course material on this device.
               </p>
             ) : null}
             {settings.backend !== "local" && !hasToken && !tokenExpired ? (
@@ -376,7 +379,7 @@ export default function SettingsLibraryPage() {
           <div className="flex items-center justify-between py-2">
             <span className="text-xs text-muted-foreground">Status</span>
             <span className="flex items-center gap-1.5 text-xs text-foreground">
-              {sidecarDown ? "Not responding" : sidecar ? activeLabel : "Checking…"}
+              {sidecarDown ? "Not ready" : sidecar ? activeLabel : "Checking…"}
               <span
                 className={cn(
                   "size-1.5 rounded-full",
@@ -391,6 +394,11 @@ export default function SettingsLibraryPage() {
               />
             </span>
           </div>
+          {sidecarError ? (
+            <p role="status" className="pb-2 text-[11px] leading-relaxed break-words text-muted-foreground">
+              {sidecarError}
+            </p>
+          ) : null}
           {!sidecarDown && sidecar ? (
             <>
               <StatRow

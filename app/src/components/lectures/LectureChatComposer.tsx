@@ -129,6 +129,7 @@ export function LectureChatComposer({
 }) {
   const [text, setText] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
+  const unavailableReason = providers.find((p) => p.id === provider)?.unavailableReason;
 
   // Put back before anything already typed, because it was typed first.
   useEffect(() => {
@@ -149,7 +150,7 @@ export function LectureChatComposer({
 
   const send = () => {
     const t = text.trim();
-    if (!t) return;
+    if (!t || unavailableReason) return;
     setText("");
     // Whether this goes out now or waits behind the running turn is Rust's
     // call, not this box's: it owns the queue and the order.
@@ -198,7 +199,7 @@ export function LectureChatComposer({
         {(!running || text.trim()) && (
           <Button
             size="icon-xs"
-            disabled={!text.trim()}
+            disabled={!text.trim() || !!unavailableReason}
             onClick={send}
             className="shrink-0"
             aria-label={running ? "Queue" : "Send"}
@@ -207,6 +208,9 @@ export function LectureChatComposer({
           </Button>
         )}
       </div>
+      {unavailableReason && (
+        <p className="text-[11px] text-muted-foreground">{unavailableReason}</p>
+      )}
     </div>
   );
 }

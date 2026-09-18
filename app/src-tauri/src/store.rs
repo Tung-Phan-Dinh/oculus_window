@@ -8,6 +8,8 @@
 //! Schema ownership stays with the plugin's migrations. If the database does
 //! not exist yet, we do not invent one; the caller reports that and keeps
 //! scraping to disk.
+//! `retrieval::pool` resolves the database file before SQLite opens it, so a
+//! CLI with a physical Windows AppData path shares the app's WAL and locks.
 
 use std::path::Path;
 

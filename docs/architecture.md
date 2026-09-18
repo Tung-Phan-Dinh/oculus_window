@@ -24,6 +24,7 @@ separate killable model workers rather than retaining their weights itself.
 | --- | --- |
 | App entry / migrations / startup | `app/src-tauri/src/lib.rs` |
 | Data-dir + path resolution (no Tauri handle needed) | `app/src-tauri/src/paths.rs` |
+| Shared SQLite filename and journal validation on Windows | `app/src-tauri/src/database.rs` |
 | Sidecar supervisor (spawn, port reclaim, shutdown) | `app/src-tauri/src/sidecar.rs` |
 | IPC callback server (sidecar → app) | `app/src-tauri/src/ipc.rs` |
 | Media HTTP server (lecture video streaming) | `app/src-tauri/src/media.rs` |
@@ -70,7 +71,11 @@ live. Inside it:
 
 - `oculus.db` — SQLite, everything structured
 - `courses/<code>/…` — scraped files, mirrored to Canvas layout, plus `.md`,
-  `.pages.json`, and `<stem>_images/` siblings the parser writes
+  `.pages.json`, and `<stem>_images/` siblings the parser writes. The separate
+  `courses/<code>/uploads/` folder holds the student's own files, copied by
+  `import_uploads` in `app/src-tauri/src/files.rs`. They use the same conversion,
+  parsing, embeddings and agent access as synced files. Sync does not write
+  into this folder; file deletion is limited to these personal uploads.
 - `lectures/<uuid>/` — downloaded Echo360 media: `source1.mp4` (the Presenter
   screen), `source2.mp4` (the room camera, when the capture has one and it has
   been asked for) and `transcript.vtt`. A `frames/` subfolder appears only when
@@ -93,8 +98,19 @@ Schema lives in the tauri-plugin-sql migrations in `app/src-tauri/src/lib.rs`
 — append-only and numbered, so the highest `version` in that list is the
 current schema. Ownership is split deliberately:
 
+On Windows, `app/src-tauri/src/database.rs` resolves the database file to its
+physical filename before either the SQL plugin or a native/CLI pool opens it.
+The frontend obtains that same URL through `library_database_url`, and
+`getDb()` shares one pending connection promise. This matters under MSIX
+AppData virtualization: aliases can refer to one database while putting its
+WAL and locks in different directories. A legacy journal in another location
+stops the open with a recovery error. Only the database file is resolved;
+coursework still uses the logical library directory's merged view.
+
 - **In the app**, the *frontend* writes the scrape tables: it listens for
-  scrape events and upserts through `app/src/lib/db.ts`.
+  scrape events and upserts through `app/src/lib/db.ts`. Writes and their
+  history records are serialized; sync completion waits for them, surfaces
+  database failures, and refreshes already-open subject views.
 - **Headless (CLI)**, `app/src-tauri/src/store.rs` writes the same rows with
   the same SQL, so a CLI sync shows up in the app as if the app had done it.
   It never creates the database — schema stays with the plugin's migrations,

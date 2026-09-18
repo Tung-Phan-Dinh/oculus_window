@@ -1,8 +1,62 @@
 # Frontend
 
-React 19 + Vite + Tailwind v4, hash-routed, Notion-style layout. UI
+React 19 + Vite + Tailwind v4, with one memory router per tab, Notion-style layout. UI
 conventions (palette, shadcn, icons, no-toasts) are in the root `CLAUDE.md` —
 this page is the structure.
+
+## Windows host
+
+The Windows build preserves the same pages, stores, typography and floating
+document layout. It uses the native decorated Windows title bar for moving,
+minimizing, maximizing and closing the window. The tab strip sits below it
+with the ordinary left inset; only macOS reserves the traffic-light gap.
+`app/src/lib/platform.ts` supplies the platform decision and shortcut labels,
+so Windows shows Ctrl/Alt hints while Mac retains Command/Option glyphs.
+The handlers already accept either platform's modifier keys.
+
+On Windows, F11 is a native menu accelerator emitting
+`menu-toggle-fullscreen`, handled by `app/src/layouts/AppLayout.tsx`; it works
+even while the native browser page holds focus. Escape in the app's webview
+leaves window fullscreen after any open dialog or popover has been dismissed.
+Leaving the lecture player's fullscreen overlay also leaves window fullscreen
+on Windows, returning its native caption controls. Mac retains its nested
+window/player fullscreen behavior.
+
+`app/src/lib/libraryPath.ts` normalizes Windows separators from agent tool
+arguments to the slash-delimited paths stored in the database. It accepts
+library-relative paths and paths from the adjacent `agents/` folder, while
+leaving absolute paths or traversal inside `courses/` as ordinary text.
+Filesystem roots still come from Tauri's `appDataDir`, and local PDFs/images
+still go through `convertFileSrc`; video continues through the Rust localhost
+media server. Windows uses the same native-browser slot measurement, popup
+occlusion handling and persistent lecture elements as the Mac frontend.
+
+Settings → Library displays the current `sidecar_health` error beneath the
+Sidecar status while the service is unavailable, including first-install
+Python/dependency setup progress and the setup log path supplied by Rust.
+The existing five-second poll clears that message once health succeeds.
+
+Fresh Windows chats start with Codex, and the unconfigured thread-naming job
+uses Codex too. Claude Code runs through WSL2 and the shared model picker
+enables it only after `harness_health` reports a ready bridge. Settings → AI
+shows the selected Linux binary, version and actionable setup errors even
+when no binary has been found.
+
+`app/src/stores/harnessHealthStore.ts` shares health between Settings, the
+main/Home composer and the lecture dock through
+`app/src/hooks/useHarnessProviders.ts`. Recheck in Settings publishes recovery
+to every picker, including the per-job rows; returning focus to the app also
+rechecks, with a 30-second throttle and a single in-flight request. A failed
+probe blocks Claude until a later success. Existing threads, drafts and
+explicit saved job choices keep their provider and model through those
+changes; health never silently reassigns them to another agent.
+
+The Uploads tab accepts Explorer paths through Tauri's native file dialog and
+drag/drop events. Loading names strip either Windows or Unix separators; the
+backend keeps canonical library-relative paths in the database. Only the active
+Uploads tab accepts drops, concurrent batches are guarded, and copy/conversion
+or database failures appear beside the file list. Non-PDF-backed uploads use the
+same system-app handoff from the command palette as from their row.
 
 ## Where
 
@@ -20,6 +74,7 @@ this page is the structure.
 | Projects (index, one board, a subject's tab) | `app/src/pages/ProjectsIndexPage.tsx`, `app/src/pages/ProjectPage.tsx`, `app/src/pages/subject/ProjectsPage.tsx`, `app/src/components/projects/`, `app/src/stores/projectsStore.ts`, `app/src/lib/projects.ts` |
 | Overlap packing, shared by the week grid and the project timeline | `app/src/lib/lanes.ts` |
 | Provider/model pickers (settings + composer) | `app/src/components/llm/` |
+| A subject's own files (the Uploads tab) | `app/src/pages/subject/UploadsPage.tsx`, `app/src/lib/uploads.ts`, `app/src-tauri/src/files.rs` |
 | Sync page + runner | `app/src/pages/SyncPage.tsx`, `app/src/lib/syncRunner.ts` |
 | Settings | `app/src/layouts/SettingsLayout.tsx`, `app/src/pages/settings/` |
 | Parse backend, memory budget + sidecar health | `app/src/pages/settings/LibraryPage.tsx` |
@@ -41,11 +96,16 @@ router over it (`app/src/components/tabs/TabPane.tsx`) — the shell is above al
 of them, so there is no one router to name. `/` is **Home**; it used to
 redirect to `/chat`. Then `/chat`, `/calendar`, `/projects`,
 `/projects/:projectId` and `/projects/:projectId/tasks/:taskId`, `/subjects`, `/subjects/:subjectId` (SubjectLayout →
-overview / modules / downloads / lectures / announcements / assignments /
-discussion / projects), `/subjects/:subjectId/file` and `/lecture` (the side
+overview / modules / downloads / uploads / lectures / announcements /
+assignments / discussion / projects), `/subjects/:subjectId/file` and `/lecture` (the side
 panel promoted to a full Notion-style page, outside SubjectLayout on purpose),
 `/sync`, and `/settings/*`. Legacy routes (`/lectures`, a subject's `files`
 tab) redirect.
+
+The initial strip currently starts at `/chat`; the + button and new-tab
+shortcut start at `/subjects` (`app/src/stores/tabStore.ts`,
+`app/src/components/tabs/TopTabBar.tsx`). These are separate from the `/` Home
+route and are preserved in the Windows build.
 
 A project lives at the top level rather than under its subject even when it has
 one, because it can have none: the subject's Projects tab and the index are two
@@ -89,14 +149,19 @@ the one moment it shows.
   `"2026 Semester 2"`, and `Su` > `Se`, so a plain string sort files Summer
   *last* in its year when it runs first. `TERM_RANK_SQL` inlines the same
   ranking as a `CASE` for the query in `getSubjects`.
-- **`getSubjects` derives `is_current`; it does not read the column.** The
-  stored flag is stamped at sync time by `list_courses` in
-  `app/src-tauri/src/sync.rs`, which takes the newest term with `.max()` over
-  term *names* — so a single summer enrolment outranks the semester actually
-  being studied and marks every real subject past. Recomputing at read time
-  costs one pass, cannot go stale between syncs, and keeps the current/past
-  split, the chat subject picker and the project pickers honest. The column
-  is still what Rust and the CLI read, so the same ranking belongs there too.
+- **`getSubjects` derives `is_current` from academic order.** Summer comes
+  before Semester 1, Winter and Semester 2; the SQL query and the Sync picker's
+  past-term groups both use `app/src/lib/terms.ts`, including short term codes
+  such as SM1 and SM2. `app/src-tauri/src/terms.rs` uses the same ranking. A
+  database stamped by an older build can still contain Summer's obsolete
+  current flags: reads repair those flags and correct the saved sync selection
+  only when it exactly matches that obsolete automatic default. Custom sets,
+  including an empty selection, survive. Fresh Canvas imports derive their
+  default independently of the event's flags. `app/src/lib/subjectSelection.ts`
+  serializes checkbox writes across every mounted Sync tab. Only pending edits
+  overlay database reads; commit notifications refresh all tabs, and revision
+  checks reject reads begun before an edit or commit. Sync waits for these
+  writes before starting a run.
 - Choosing MinerU cloud or Automatic opts into uploading PDFs to MinerU's
   PRC-hosted service; Local only is the default. Token save/remove invokes
   Rust keychain commands, never DB writes. Automatic is cloud-first when a
@@ -113,6 +178,21 @@ the one moment it shows.
   text and patches tool rows — see [harness.md](./harness.md). It is
   app-level rather than page-level because a thread keeps running on
   another page and the sidebar's Chat row spins while one does.
+- **Sync completion waits for the library's writes.** Tauri does not await
+  asynchronous event handlers, so `app/src/lib/syncWrites.ts` serializes file
+  metadata, parse-state and ledger writes and drains them before finishing the
+  run. A file's success ledger row comes after its metadata commit; a failed
+  write fails the run visibly even if recording the failure also fails.
+  `app/src/lib/parseEvents.ts` applies the database commit, parse badge and
+  pipeline transition together inside that queue. A late running heartbeat
+  checks the already committed quality state there, so a busy write queue
+  cannot make a finished file look active again.
+  Downloads observes committed-file events instead of writing the same rows a
+  second time. New-file badges also refresh from these committed events, so a
+  slow metadata queue cannot leave their final count behind. `useSubjects` and
+  `useSubjectFiles` reload on the completion
+  counter, so a subject left mounted before sync receives the new metadata and
+  files. Upload change events also refresh every mounted subject file list.
 - **`app/src/lib/tauriEvents.ts` is imported for its side effect only, before
   `./App` in `app/src/main.tsx`, and is not dead code.** Tauri's injected
   `unlisten` reads `listeners[eventId].handlerId` after checking only that the
@@ -156,13 +236,49 @@ the one moment it shows.
   with the history table and interrupted runs never count as a sync.
 - `SubjectLayout` resolves the subject once and hands it to tab pages via
   outlet context — tab pages must not re-fetch it. Its underline tabs are a
-  **sideways scroller**, not a row that gets clipped: eight tabs already crowd
+  **sideways scroller**, not a row that gets clipped: nine tabs already crowd
   the centred column and the card is narrower still with the side panel docked
   open, so the row scrolls with its bar hidden, a fade over each live edge (the
   sidebar's affordance) and the active tab scrolled into view. The `-mb-px`
   that lands the active underline on the header's border sits on the scroller,
   not on the tabs: `overflow-x` clips on both axes, so inside it the underline
   would go with it.
+- **Uploads is the one subject tab whose rows nothing scraped**, and it is
+  thin because it has to add almost nothing. `import_uploads` copies the picked
+  bytes into `courses/<code>/uploads/` and converts Office documents there the
+  same way a download is converted; from that moment the file is an ordinary
+  library file, so the parse sweep, the embed hop, ⌘K, semantic search and the
+  chat agent's `courses/` all reach it without knowing it was never on Canvas.
+  What `app/src/lib/uploads.ts` adds is the `files` row and the first parse
+  kick — **in that order**, because `embedAfterParse` in `useBackendEvents`
+  resolves a finished parse back to a file by `(subject_id, relative_path)`,
+  and a file parsed before its row exists would never be indexed.
+  Three choices are worth keeping. The picker and the drag both hand back
+  **paths**, never bytes, so nothing large crosses the IPC bridge. A name
+  already taken steps aside (`notes.pdf` → `notes-2.pdf`) rather than
+  overwriting, except for byte-identical content under the same name, which is
+  the same file again and keeps its parse; adding the wrong file can therefore
+  never destroy the right one. And an Explorer/Finder drag is a **native window
+  event** (`onDragDropEvent`) rather than an HTML drop, which means it is the
+  *window's* event, not the page's: every tab stays
+  mounted, so the page scopes it with `useTabActive` or a backgrounded Uploads
+  tab would claim a drop meant for whatever is in front.
+  Deleting is the only destructive control in the library, and its guard is
+  `is_upload_rel` in `app/src-tauri/src/paths.rs`, not a confirmation dialog:
+  only a path under some subject's `uploads/` can be removed at all. It takes
+  the converted PDF and `purge_parse_artifacts` with it, and the `pages` rows
+  too — which `deleteFileRow` writes out by hand, since nothing sets
+  `PRAGMA foreign_keys=ON` and the declared cascade is documentation rather
+  than a guarantee.
+  **A delete reserves its old filename.** A quality pass still running when
+  removal lands can write its markdown afterwards. Rust records the removed
+  name in the private `.oculus-upload-reservations/` directory, so a later
+  upload gets a new suffix even before those late artifacts appear. Reserving
+  original and derived names also prevents an uploaded PDF from colliding
+  with an Office file's converted sibling. `purge_parse_artifacts` removes the
+  parsed markdown and its `{stem}_images/` figures together; the frontend
+  removes the indexed rows and closes any side-panel preview of the deleted
+  file. The source file selected in Explorer is never removed.
 - **The shell is furniture around a floating document.** `AppLayout` puts the
   sidebar and `TopTabBar` straight onto the window ground and renders content
   as an inset rounded card, so neither needs a divider of its own. Two

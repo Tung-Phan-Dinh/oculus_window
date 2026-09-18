@@ -10,7 +10,6 @@ import { displayCode } from "@/lib/format";
 import { searchMentionFiles, type MentionFile, type Subject } from "@/lib/db";
 import {
   CLAUDE_MODELS,
-  PROVIDERS,
   codexAsModels,
   defaultSelection,
   harnessCodexModels,
@@ -20,6 +19,7 @@ import {
   type ThreadUsage,
 } from "@/lib/harness";
 import { cn } from "@/lib/utils";
+import { useHarnessProviders } from "@/hooks/useHarnessProviders";
 
 /** How much of an `@` token to look at. Long enough for a real filename,
  *  short enough that a stray `@` in prose stops matching once the sentence
@@ -129,6 +129,7 @@ export function Composer({
   autoFocus?: boolean;
 }) {
   const [text, setText] = useState("");
+  const providers = useHarnessProviders();
   const ref = useRef<HTMLTextAreaElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -184,7 +185,7 @@ export function Composer({
   // A subject change re-scopes what `@` may reach, so the open list is stale.
   useEffect(() => setMention(null), [subjectId]);
 
-  const pickerProviders: PickerProvider[] = PROVIDERS.map((p) =>
+  const pickerProviders: PickerProvider[] = providers.map((p) =>
     p.id === "claude"
       ? { ...p, models: CLAUDE_MODELS }
       : { ...p, models: codexAsModels(codexModels ?? []), loading: codexModels === null },
@@ -194,7 +195,7 @@ export function Composer({
   // Codex before its CLI has answered — is filled the moment a list exists.
   const active = pickerProviders.find((p) => p.id === provider);
   useEffect(() => {
-    if (model || !active || active.loading || active.models.length === 0) return;
+    if (model || !active || active.unavailableReason || active.loading || active.models.length === 0) return;
     const pick = defaultSelection(active.models);
     if (!pick.model) return;
     onModel(pick.model);
@@ -270,7 +271,7 @@ export function Composer({
 
   const send = () => {
     const t = text.trim();
-    if (!t) return;
+    if (!t || active?.unavailableReason) return;
     setText("");
     setMention(null);
     // Whether this goes out now or waits behind the running turn is Rust's
@@ -398,7 +399,7 @@ export function Composer({
           {(!running || text.trim()) && (
             <Button
               size="icon-xs"
-              disabled={!text.trim()}
+              disabled={!text.trim() || !!active?.unavailableReason}
               onClick={send}
               className="shrink-0"
               aria-label={running ? "Queue" : "Send"}
@@ -407,6 +408,9 @@ export function Composer({
             </Button>
           )}
         </div>
+        {active?.unavailableReason && (
+          <p className="text-[11px] text-muted-foreground">{active.unavailableReason}</p>
+        )}
       </div>
     </div>
   );

@@ -1,0 +1,27 @@
+{
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Oculus",
+        "width": 1480,
+        "height": 920,
+        "minWidth": 900,
+        "minHeight": 560,
+        "decorations": true
+      }
+    ]
+  },
+  "bundle": {
+    "targets": ["nsis"],
+    "resources": {
+      "resources/sidecar/": "sidecar/",
+      "resources/tools/uv.exe": "tools/uv.exe"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  }
+}

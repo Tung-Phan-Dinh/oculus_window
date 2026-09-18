@@ -4,10 +4,11 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import pymupdf4llm
 from pathlib import Path
+
+from process_runtime import spawn_python
 
 
 def pages_path(pdf_path) -> Path:
@@ -97,10 +98,24 @@ _UNSAFE_IN_PATH = set(" ()[]")
 
 
 def _scratch_root() -> str:
-    for candidate in (tempfile.gettempdir(), "/tmp"):
-        if candidate and not (_UNSAFE_IN_PATH & set(candidate)):
+    candidates = [tempfile.gettempdir()]
+    if os.name == "nt":
+        # The per-user temp path can contain spaces. Use its short form where
+        # available; never assume a root-level /tmp directory exists on Windows.
+        from ctypes import create_unicode_buffer, windll
+
+        buffer = create_unicode_buffer(32768)
+        size = windll.kernel32.GetShortPathNameW(candidates[0], buffer, len(buffer))
+        if 0 < size < len(buffer):
+            candidates.append(buffer.value)
+    else:
+        candidates.append("/tmp")
+    for candidate in candidates:
+        if candidate and Path(candidate).is_dir() and not (_UNSAFE_IN_PATH & set(candidate)):
             return candidate
-    raise RuntimeError("no temp directory with a path safe for image extraction")
+    # parse_fast changes only its throwaway process's cwd and hands pymupdf a
+    # relative image path. That works even when short filenames are disabled.
+    return tempfile.gettempdir()
 
 
 def _normalise_images(directory: Path) -> dict[str, str]:
@@ -198,14 +213,26 @@ def parse_fast(pdf_path: str) -> dict:
     # it is given — spaces become underscores — and uses that *same* mangled
     # string to save the file, so writing straight into the library fails on
     # macOS, where the data directory is always ".../Application Support/…".
+    path = path.resolve()
     with tempfile.TemporaryDirectory(prefix="oculus-img-", dir=_scratch_root()) as scratch:
-        chunks = pymupdf4llm.to_markdown(
-            str(path),
-            page_chunks=True,
-            write_images=True,
-            image_path=scratch,
-            image_format="png",
-        )
+        old_cwd = os.getcwd()
+        relative_images = bool(_UNSAFE_IN_PATH & set(scratch))
+        try:
+            # A relative path cannot be mangled by pymupdf4llm's sanitisation
+            # of an absolute Windows username containing spaces or brackets.
+            # Normal use always runs this in a one-shot process.
+            if relative_images:
+                os.chdir(scratch)
+            chunks = pymupdf4llm.to_markdown(
+                str(path),
+                page_chunks=True,
+                write_images=True,
+                image_path="." if relative_images else scratch,
+                image_format="png",
+            )
+        finally:
+            if relative_images:
+                os.chdir(old_cwd)
         images_dir.mkdir(parents=True, exist_ok=True)
         for f in Path(scratch).iterdir():
             if f.is_file():
@@ -267,30 +294,40 @@ def parse_fast_isolated(pdf_path: str) -> dict:
 
     from parse_worker import SENTINEL
 
+    job = None
+    proc = None
     try:
-        proc = subprocess.run(
-            [sys.executable, "parse_worker.py", str(pdf_path)],
+        proc, job = spawn_python(
+            "parse_worker.py", str(Path(pdf_path).resolve()),
             cwd=str(Path(__file__).resolve().parent),
-            capture_output=True,
-            text=True,
-            timeout=PARSE_WORKER_TIMEOUT,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
+        stdout, stderr = proc.communicate(timeout=PARSE_WORKER_TIMEOUT)
     except subprocess.TimeoutExpired:
+        if job is not None:
+            job.terminate()
+        elif proc is not None:
+            proc.kill()
+        if proc is not None:
+            proc.communicate()
         raise RuntimeError(
             f"fast parse timed out after {PARSE_WORKER_TIMEOUT}s: {Path(pdf_path).name}"
         ) from None
+    finally:
+        if job is not None:
+            job.close()
 
     # The worker forwards anything its dependencies printed; keep it visible so
     # the sidecar log still reads as one stream.
     payload = None
-    for line in proc.stdout.splitlines():
+    for line in stdout.splitlines():
         if line.startswith(SENTINEL):
             payload = line[len(SENTINEL):]
         else:
             print(line)
-    if proc.stderr.strip():
-        print(proc.stderr.rstrip())
+    if stderr.strip():
+        print(stderr.rstrip())
 
     if payload is None:
         # No result line at all: the worker died before it could report — an

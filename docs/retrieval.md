@@ -49,7 +49,13 @@ Benchmarked 2026-08-15 on real course decks (152-page corpus, then re-run at
   pages; at 512 dims that is single-digit MB and milliseconds. Scale was
   checked: a 6.5× bigger adjacent-topic library cost one query of recall.
 - The shipped `Qwen3VLEmbedder` hardcodes cuda-else-cpu; `sidecar/embedder.py`
-  subclasses it onto MPS.
+  subclasses it to select MPS, then CUDA, then CPU. Windows x64 installs the
+  CUDA-enabled torch/torchvision pair from the official CUDA 13.0 index;
+  Windows CUDA places checkpoint weights directly on the GPU using
+  Accelerate's device map to avoid a temporary full CPU copy. The stored
+  embedding contract and query instruction are unchanged. The MPS
+  timing/batching measurements above should not be
+  interpreted as Windows performance measurements.
 
 ## How it connects
 

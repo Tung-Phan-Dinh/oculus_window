@@ -13,7 +13,7 @@ dependencies = [
     #
     # `[pipeline]`, NOT `[core]`. core = pipeline + vlm + gradio; we drive the
     # pipeline backend directly in-process, so the VLM backend (accelerate) and
-    # the gradio web UI (which also pins starlette down) are dead weight.
+    # the gradio web UI (which also pins starlette down) are dead weight for MinerU.
     "mineru[pipeline]>=3.4.5",
     # Undeclared dependency of MinerU's vendored pytorchocr
     # (mineru/model/utils/pytorchocr/data/imaug/operators.py does `import six`).
@@ -44,8 +44,26 @@ dependencies = [
     # UniMERNet's generate() returns out-of-range token ids on MPS and the
     # tokenizer dies with "OverflowError: out of range integral type conversion".
     "torch>=2.13.0",
+    # Direct so uv also selects the matching CUDA torchvision wheel on Windows.
+    "torchvision>=0.28.0",
+    # Load Qwen directly onto CUDA on Windows instead of staging a complete
+    # CPU model before .to(cuda), which exceeds the default host-memory budget.
+    "accelerate>=1.0.0; sys_platform == 'win32'",
     "transformers>=4.57.0",
     "qwen-vl-utils>=0.0.14",
     "numpy>=1.26.0",
-    "huggingface-hub>=0.30.0",
+    # Native chunked transfers for multi-GB weights on Windows as well as Mac.
+    "huggingface-hub[hf_xet]>=0.30.0",
 ]
+
+# PyPI ships CPU-only torch wheels on Windows. Keep upstream pins, but select
+# the official CUDA 13.0 build for Windows x64 (RTX 4070, driver CUDA >=13.0).
+# Other platforms keep their existing PyPI/MPS behavior.
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32' and platform_machine == 'AMD64'" }]
+torchvision = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32' and platform_machine == 'AMD64'" }]

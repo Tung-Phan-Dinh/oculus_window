@@ -7,12 +7,13 @@ import os
 import queue
 import signal
 import subprocess
-import sys
 import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Callable
+
+from process_runtime import spawn_python
 
 
 class WorkerError(RuntimeError):
@@ -35,9 +36,11 @@ class WorkerProcess:
         self.label = label
         self.idle_timeout = idle_timeout
         self._process: subprocess.Popen | None = None
+        self._job = None
         self._messages: queue.Queue[str | None] = queue.Queue()
         self._request_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        self._stop_lock = threading.Lock()
         self._active: str | None = None
         self._last_used = 0.0
         self._stop_reason: str | None = None
@@ -71,23 +74,24 @@ class WorkerProcess:
         with self._state_lock:
             if self._process is not None and self._process.poll() is None:
                 return self._process
+            if self._job is not None:
+                self._job.close()
+                self._job = None
 
             messages: queue.Queue[str | None] = queue.Queue()
             self._messages = messages
             self._stop_reason = None
             sidecar_dir = Path(__file__).resolve().parent
-            process = subprocess.Popen(
-                [sys.executable, self.script],
+            process, job = spawn_python(
+                self.script,
                 cwd=str(sidecar_dir),
-                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
                 bufsize=1,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
                 start_new_session=os.name != "nt",
             )
             self._process = process
+            self._job = job
             self._generation += 1
             self._last_used = time.monotonic()
 
@@ -191,6 +195,12 @@ class WorkerProcess:
                     if event == "result":
                         return response.get("data")
                     if event == "error":
+                        if response.get("error_type") in {"OutOfMemoryError", "MemoryError"}:
+                            # CUDA VRAM is separate from the sampled host-memory
+                            # budget. Reclaim the whole owner on allocator OOM
+                            # so local quality can use its smaller retry rung.
+                            self.stop("model allocation exhausted memory", force=True)
+                            raise WorkerDied(response.get("error") or "model ran out of memory")
                         raise WorkerRequestError(response.get("error") or f"{op} failed")
             except (BrokenPipeError, OSError) as error:
                 raise WorkerDied(f"{self.label} pipe failed: {error}") from error
@@ -220,8 +230,13 @@ class WorkerProcess:
             self._request_lock.release()
 
     def stop(self, reason: str = "stopped", *, force: bool = False) -> None:
+        with self._stop_lock:
+            self._stop(reason, force=force)
+
+    def _stop(self, reason: str, *, force: bool) -> None:
         with self._state_lock:
             process = self._process
+            job = self._job
             if process is None:
                 return
             self._stop_reason = reason
@@ -229,6 +244,8 @@ class WorkerProcess:
         try:
             if os.name != "nt":
                 os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+            elif job is not None:
+                job.terminate()
             elif force:
                 process.kill()
             else:
@@ -260,6 +277,9 @@ class WorkerProcess:
         with self._state_lock:
             if self._process is process:
                 self._process = None
+                self._job = None
+        if job is not None:
+            job.close()
 
     def shutdown(self) -> None:
         if self.is_alive and not self.is_busy:

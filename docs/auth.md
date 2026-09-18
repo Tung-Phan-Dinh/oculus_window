@@ -3,6 +3,35 @@
 Three services, three credentials — but everything derives from one Canvas
 session cookie.
 
+## Windows integration
+
+`app/src-tauri/src/auth.rs` and `app/src-tauri/src/browser.rs` put the sign-in
+window and remote browser tabs in the same WebView2 profile under
+`%APPDATA%\com.tchan.oculus\canvas-session`. The privileged app webview keeps
+its own profile. A new browser tab starts blank, restores the saved Canvas
+cookie through Tauri's native `set_cookie` API, then navigates. Cookie reads
+run away from WebView2's event-loop thread to avoid deadlocks. Disconnect
+clears the browser profile through the native API and closes its tabs;
+Windows keeps live profile files locked, so disconnect does not delete that
+directory while WebView2 owns it.
+
+Passwords, TOTP seeds, MinerU tokens and provider keys use Windows Credential
+Manager through keyring's Windows backend. The Canvas cookie remains the
+existing local snapshot; no credential is copied from a macOS installation.
+
+The closed-app keep-alive in `app/src-tauri/src/keepalive.rs` uses Windows
+Task Scheduler. Each Windows user gets a task named with their SID, running
+with limited privileges while that user is logged in. It invokes the bundled
+`oculus.exe auth tick` through hidden PowerShell every selected number of
+hours, including on battery, and catches up after a missed run. No Windows
+password or elevation is needed. Installation still follows a successful
+headless Canvas sign-in or the explicit Settings switch; disabling it saves
+the same opt-out marker as macOS. Startup repairs a moved executable path.
+The scheduler's action receives an encoded, literal-path invocation so spaces,
+apostrophes and other punctuation in an installation path remain data.
+
+The launchd details below describe the retained macOS implementation.
+
 ## Where
 
 | Piece | Location |

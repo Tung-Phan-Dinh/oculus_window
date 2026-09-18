@@ -12,6 +12,66 @@ The BYOK layer in [llm.md](./llm.md) is dormant while this is the chat: its
 Rust and Settings section are still there, nothing routes to them, and the
 old chat page and store are gone.
 
+## Windows bridge boundary
+
+Native Windows chat uses **Codex** with the same `workspace-write` policy and
+`agents/` working directory as the macOS bridge. A working Codex CLI with its
+Windows sandbox configured is required; Oculus never replaces a failed
+sandbox with unrestricted execution. Windows thread naming defaults to Codex
+on `gpt-5.6-luna` at `low`, matching the frontend job registry.
+
+Claude Code runs through **WSL2** on Windows; its native Windows executable
+does not supply the required filesystem sandbox
+([provider documentation](https://code.claude.com/docs/en/sandboxing)).
+`app/src-tauri/src/harness/wsl.rs` selects the dedicated `Oculus` distribution,
+then an eligible user WSL2 distribution; `OCULUS_CLAUDE_WSL_DISTRO` selects one
+explicitly. Docker's internal distributions and WSL1 are excluded. Discovery
+checks a non-root Linux user, the native Linux Claude executable, sandbox
+dependencies, and Claude's Linux sign-in. Settings reports actionable errors;
+Recheck refreshes provider availability throughout the app. Existing Claude
+threads and drafts retain their provider, and failures never switch providers.
+See [WSL2 setup](./claude-wsl-setup.md) for the setup script and sign-in command.
+
+The embedded `app/src-tauri/src/harness/wsl_bridge.py` supervisor receives
+configuration and messages as JSON over pipes. Windows library paths are
+translated with `wslpath`; prompts do not become shell commands. An outer
+bubblewrap namespace makes the library read-only except for `agents/`, hides
+other Windows mounts and interoperability endpoints, and restricts host socket
+access with seccomp. This applies to Claude's built-in file tools as well as
+shells. Claude's own inner sandbox also runs with fail-if-unavailable and no
+unsandboxed retry, and protects its writable Linux authentication/session state.
+
+The Linux `oculus` command uses four private FIFO channel pairs and the existing pipes
+to call `app/src-tauri/src/harness/wsl_cli.rs` in Windows. This broker launches
+the bundled CLI with argv, fixed library ownership, bounded input/output,
+four-command concurrency and a 90-second deadline. It permits library queries,
+project/task planning and lecture candidate detection; authentication, syncing,
+recursive agent jobs and memory-budget changes stay with the application.
+FIFO slots use file locks and request identifiers, so concurrent tools and
+cancelled requests cannot mix replies. A turn generation captured before a
+command queues is checked on both sides of the bridge, preventing an interrupted
+turn's queued commands from running during the next turn. Unix sockets stay blocked inside
+Claude's Linux sandbox; its path-specific socket allowlist is macOS-only.
+Task-batch files are opened inside Linux and passed through stdin. Queries
+never auto-refresh an empty subject list. Planning writes and generated lecture
+frames are explicit native CLI capabilities, not direct agent filesystem writes.
+
+Interrupting a turn cancels its native broker requests. Closing a session kills
+its Windows Job Object and Linux process namespace. Pipe EOF and a 15-second
+heartbeat deadline also terminate detached Linux descendants after an app crash.
+Resume and rewind use Claude's Linux transcript, accessed through the selected
+distribution's `\\wsl.localhost` share.
+
+`app/src-tauri/src/harness/discover.rs` searches native `.exe` files before
+Windows npm shims, checks the usual user/AppData/Node locations, and retains
+the explicit `OCULUS_CODEX_BIN` override. `OCULUS_CLAUDE_BIN` remains the
+native-platform override outside Windows; Windows Claude uses the distribution
+selection above. Standard
+`codex.cmd` and `claude.cmd` npm installations are resolved to their package
+JavaScript and launched with Node directly, so prompt text never passes
+through `cmd.exe`. Custom batch wrappers require an override pointing to a
+native executable. Console helpers launch without a terminal window.
+
 ## Where
 
 | Piece | Location |

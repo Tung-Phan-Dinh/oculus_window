@@ -1,0 +1,7 @@
+{
+  "source": "../oculus",
+  "branch": "andre",
+  "lastImportedCommit": "e63012830712d83af054f3d4536adec7315c0d20",
+  "platform": "windows",
+  "notes": "Keep Windows adaptations in this repository. Import later macOS changes relative to lastImportedCommit and update it only after merging and verifying them."
+}

@@ -321,8 +321,9 @@ const MODEL_MEM_FACTOR: f64 = 1.15;
 const MEM_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Physical memory, from `sysctl hw.memsize`.
+#[cfg(target_os = "macos")]
 fn total_memory() -> Option<u64> {
-    let out = std::process::Command::new("sysctl")
+    let out = crate::platform::command("sysctl")
         .args(["-n", "hw.memsize"])
         .output()
         .ok()?;
@@ -332,9 +333,10 @@ fn total_memory() -> Option<u64> {
 /// Memory the machine could hand a model right now: physical memory less the
 /// wired pages and a reserve. Page size comes out of `vm_stat`'s own header —
 /// it is 16 KB on Apple silicon, and assuming 4 KB miscounts by fourfold.
+#[cfg(target_os = "macos")]
 fn assignable_memory() -> Option<u64> {
     let total = total_memory()?;
-    let out = std::process::Command::new("vm_stat").output().ok()?;
+    let out = crate::platform::command("vm_stat").output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let mut page_size = 4096u64;
     let mut wired = 0u64;
@@ -353,6 +355,20 @@ fn assignable_memory() -> Option<u64> {
         }
     }
     (wired > 0).then(|| total.saturating_sub(wired * page_size + MEM_RESERVE))
+}
+
+#[cfg(windows)]
+fn assignable_memory() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0)
+        .then(|| status.ullAvailPhys.saturating_sub(MEM_RESERVE))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn assignable_memory() -> Option<u64> {
+    None
 }
 
 /// On-disk size of an Ollama model, from its native `/api/tags`. The

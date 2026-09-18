@@ -13,6 +13,7 @@ parser.py writes. The two meet on (file, page_no).
 import base64
 import importlib.util
 import json
+import os
 import sys
 import threading
 import time
@@ -51,6 +52,13 @@ from modellock import MODEL_INIT_LOCK
 RENDER_DPI = 200
 _PIXELS_PER_TOKEN = 32 * 32  # patch 16 with 2x2 spatial merge
 
+# A spreadsheet exported with SinglePageSheets can be far larger than a
+# normal printed page. At 200 DPI a 3418x3853pt sheet would allocate 305 MB
+# of RGB before the model downsizes it to its 640-token (~0.66 MP) budget.
+# Keep extra rendering detail without that transient memory spike. A4 at
+# 200 DPI is 3.9 MP, so ordinary pages and their stored vectors are unchanged.
+MAX_RENDER_PIXELS = 8_000_000
+
 # Asymmetric retrieval: documents are embedded plainly, queries carry a task
 # instruction. Changing either invalidates every stored vector.
 _embedder = None
@@ -68,6 +76,9 @@ def _load_model():
     we import the file. Its __init__ also hardcodes `cuda if available else
     cpu`, which on a Mac silently lands on CPU, so we subclass to place it.
     """
+    from model_downloads import prepare_model_downloads
+
+    prepare_model_downloads()
     from huggingface_hub import snapshot_download
 
     path = snapshot_download(MODEL_REPO)
@@ -94,9 +105,16 @@ def _load_model():
             self.num_frames = mod.MAX_FRAMES
             self.max_frames = mod.MAX_FRAMES
             self.default_instruction = "Represent the user's input."
-            self.model = mod.Qwen3VLForEmbedding.from_pretrained(
-                model_path, dtype=torch.bfloat16
-            ).to(device)
+            if os.name == "nt" and device == "cuda":
+                # Materialise checkpoint weights directly on the GPU instead
+                # of retaining a temporary CPU copy during CUDA placement.
+                self.model = mod.Qwen3VLForEmbedding.from_pretrained(
+                    model_path, dtype=torch.bfloat16, device_map={"": device}
+                )
+            else:
+                self.model = mod.Qwen3VLForEmbedding.from_pretrained(
+                    model_path, dtype=torch.bfloat16
+                ).to(device)
             self.processor = mod.Qwen3VLProcessor.from_pretrained(
                 model_path, padding_side="right"
             )
@@ -139,12 +157,22 @@ def _b64(arr: np.ndarray) -> str:
     return base64.b64encode(arr.tobytes()).decode("ascii")
 
 
+def _page_zoom(page, zoom: float) -> tuple[float, float]:
+    """`zoom`, lowered if this page would render past MAX_RENDER_PIXELS."""
+    rect = page.rect
+    area = max(1.0, rect.width * rect.height)
+    capped = (MAX_RENDER_PIXELS / area) ** 0.5
+    z = min(zoom, capped)
+    return z, z
+
+
 def render_pages(pdf_path: str, dpi: int = RENDER_DPI):
-    doc = fitz.open(pdf_path)
-    zoom = dpi / 72
-    for i in range(doc.page_count):
-        pix = doc[i].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-        yield i + 1, Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    with fitz.open(pdf_path) as doc:
+        zoom = dpi / 72
+        for i in range(doc.page_count):
+            page = doc[i]
+            pix = page.get_pixmap(matrix=fitz.Matrix(*_page_zoom(page, zoom)))
+            yield i + 1, Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
 
 def embed_query(text: str) -> np.ndarray:

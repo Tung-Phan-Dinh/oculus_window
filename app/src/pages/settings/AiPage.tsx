@@ -4,12 +4,9 @@ import { listen } from "@tauri-apps/api/event";
 import { ArrowsClockwise, CircleNotch, PaperPlaneRight, Plus, X } from "@phosphor-icons/react";
 import {
   CLAUDE_MODELS,
-  PROVIDERS,
   codexAsModels,
   defaultSelection,
   harnessCodexModels,
-  harnessHealth,
-  type BridgeHealth,
   type CodexModel,
   type Provider,
 } from "@/lib/harness";
@@ -61,6 +58,9 @@ import {
   type ModelRef,
 } from "@/lib/db";
 import { Section, StatRow } from "./section";
+import { isWindows } from "@/lib/platform";
+import { useHarnessProviders } from "@/hooks/useHarnessProviders";
+import { useHarnessHealthStore } from "@/stores/harnessHealthStore";
 
 interface UsageSummary {
   monthPromptTokens: number;
@@ -85,21 +85,18 @@ function newProviderId(kind: string, existing: LlmProvider[]): string {
  * install.
  */
 function CliAgentsSection() {
-  const [health, setHealth] = useState<BridgeHealth[] | null>(null);
-  const [checking, setChecking] = useState(false);
-  const check = useCallback(() => {
-    setChecking(true);
-    harnessHealth()
-      .then(setHealth)
-      .catch(() => setHealth([]))
-      .finally(() => setChecking(false));
-  }, []);
-  useEffect(check, [check]);
+  const health = useHarnessHealthStore((state) => state.health);
+  const checking = useHarnessHealthStore((state) => state.checking);
+  const error = useHarnessHealthStore((state) => state.error);
+  const refresh = useHarnessHealthStore((state) => state.refresh);
+  useEffect(() => { void refresh(); }, [refresh]);
 
   return (
     <Section
       title="CLI agents"
-      description="Chat runs Claude Code or Codex from your own machine, signed in as you — no API key, no per-token billing."
+      description={isWindows
+        ? "Chat runs Codex on Windows or Claude Code through WSL2, signed in as you. Claude uses its Linux sandbox and a separate sign-in inside WSL2."
+        : "Chat runs Claude Code or Codex from your own machine, signed in as you — no API key, no per-token billing."}
     >
       <div className="divide-y divide-border-subtle">
         {(health ?? []).map((h) => (
@@ -107,24 +104,25 @@ function CliAgentsSection() {
             <div className="min-w-0">
               <div className="text-[13px] text-foreground">{h.label}</div>
               <div className="mt-0.5 truncate text-xs text-muted-foreground">
-                {h.path ?? (
+                {h.path ?? (!h.error && (
                   <>
                     Not found. Install it, or set <span className="text-foreground">{h.overrideEnv}</span> to the binary.
                   </>
-                )}
+                ))}
               </div>
-              {h.error && h.path && <div className="mt-0.5 text-xs text-destructive">{h.error}</div>}
+              {h.error && <div className="mt-0.5 text-xs text-destructive">{h.error}</div>}
             </div>
             <div className="shrink-0 text-xs tabular-nums text-muted-foreground">
-              {h.version ? `v${h.version}` : h.path ? "—" : "missing"}
+              {h.error ? "unavailable" : h.version ? `v${h.version}` : h.path ? "—" : "missing"}
             </div>
           </div>
         ))}
-        {health === null && (
+        {health === null && !error && (
           <div className="py-2.5 text-xs text-muted-foreground">Checking…</div>
         )}
       </div>
-      <Button variant="ghost" size="xs" className="mt-2" onClick={check} disabled={checking}>
+      {error && <p className="mt-1 text-xs text-destructive">{error}</p>}
+      <Button variant="ghost" size="xs" className="mt-2" onClick={() => { void refresh(true); }} disabled={checking}>
         {checking ? <CircleNotch size={12} className="animate-spin" /> : <ArrowsClockwise size={12} />}
         Recheck
       </Button>
@@ -143,6 +141,7 @@ function CliAgentsSection() {
  * second copy of the selection anywhere.
  */
 function JobModelsSection() {
+  const availableProviders = useHarnessProviders();
   const [jobs, setJobs] = useState<JobModels | null>(null);
   const [codex, setCodex] = useState<CodexModel[] | null>(null);
   /** What is already in the database, so the save effect below can tell an
@@ -171,7 +170,7 @@ function JobModelsSection() {
     (p: Provider) => (p === "claude" ? CLAUDE_MODELS : codexAsModels(codex ?? [])),
     [codex],
   );
-  const providers: PickerProvider[] = PROVIDERS.map((p) => ({
+  const providers: PickerProvider[] = availableProviders.map((p) => ({
     ...p,
     models: models(p.id),
     loading: p.id === "codex" && codex === null,
@@ -387,7 +386,7 @@ export default function SettingsAiPage() {
 
       <Section
         title="Providers"
-        description="Local and cloud providers share the same OpenAI-compatible API, and you can keep as many as you like configured at once. Keys are stored in the macOS keychain, never in the database."
+        description="Local and cloud providers share the same OpenAI-compatible API, and you can keep as many as you like configured at once. Keys are stored in your device's credential store, never in the database."
       >
         <div className="flex flex-col gap-2 py-1">
           {settings.providers.map((p) => (

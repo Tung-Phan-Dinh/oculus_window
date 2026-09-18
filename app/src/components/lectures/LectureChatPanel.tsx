@@ -7,10 +7,10 @@ import { Timeline } from "@/components/harness/Timeline";
 import { type PickerProvider } from "@/components/harness/ModelPicker";
 import { LectureChatComposer } from "@/components/lectures/LectureChatComposer";
 import { useStickToBottom } from "@/hooks/useStickToBottom";
+import { useHarnessProviders } from "@/hooks/useHarnessProviders";
 import { fmtAgo, sqliteUtcToMs } from "@/lib/format";
 import {
   CLAUDE_MODELS,
-  PROVIDERS,
   codexAsModels,
   defaultSelection,
   getLectureThreads,
@@ -85,6 +85,7 @@ export const LectureChatPanel = memo(function LectureChatPanel({
   buildMoment,
 }: LectureChatPanelProps) {
   const store = useHarnessStore;
+  const providers = useHarnessProviders();
 
   // Resolved from `dockThread` if this lecture has been talked to this
   // session, otherwise from its most recent thread. `resolved` is what keeps
@@ -175,7 +176,7 @@ export const LectureChatPanel = memo(function LectureChatPanel({
     harnessCodexModels().then(setCodexModels).catch(() => setCodexModels([]));
   }, [activeProvider, codexModels]);
 
-  const pickerProviders: PickerProvider[] = PROVIDERS.map((p) =>
+  const pickerProviders: PickerProvider[] = providers.map((p) =>
     p.id === "claude"
       ? { ...p, models: CLAUDE_MODELS }
       : { ...p, models: codexAsModels(codexModels ?? []), loading: codexModels === null },
@@ -185,7 +186,7 @@ export const LectureChatPanel = memo(function LectureChatPanel({
   // Codex before its CLI has answered — is filled the moment a list exists.
   const active = pickerProviders.find((p) => p.id === activeProvider);
   useEffect(() => {
-    if (model || !active || active.loading || active.models.length === 0) return;
+    if (model || !active || active.unavailableReason || active.loading || active.models.length === 0) return;
     const pick = defaultSelection(active.models);
     if (!pick.model) return;
     const s = store.getState();

@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -94,6 +94,8 @@ struct ThreadState {
 
 pub struct CodexServer {
     child: Mutex<Child>,
+    #[cfg(windows)]
+    job: Mutex<Option<crate::platform::ProcessJob>>,
     stdin: Mutex<ChildStdin>,
     next_id: AtomicI64,
     pending: Mutex<HashMap<i64, mpsc::Sender<Result<Value, String>>>>,
@@ -106,7 +108,7 @@ pub struct CodexServer {
 
 impl CodexServer {
     pub fn spawn(cfg: CodexSpawn) -> Result<Arc<Self>, String> {
-        let mut child = Command::new(&cfg.bin)
+        let mut child = super::discover::provider_command(&cfg.bin)?
             .arg("app-server")
             .env_clear()
             .envs(cfg.env.iter().map(|(k, v)| (k, v)))
@@ -115,6 +117,12 @@ impl CodexServer {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("cannot start {}: {e}", cfg.bin.display()))?;
+        #[cfg(windows)]
+        let job = crate::platform::ProcessJob::assign(&child).map_err(|e| {
+            let _ = child.kill();
+            let _ = child.wait();
+            format!("cannot supervise Codex process tree: {e}")
+        })?;
         let stdin = child.stdin.take().ok_or("no stdin on codex child")?;
         let stdout = child.stdout.take().ok_or("no stdout on codex child")?;
         let stderr = child.stderr.take().ok_or("no stderr on codex child")?;
@@ -122,6 +130,8 @@ impl CodexServer {
         let alive = Arc::new(AtomicBool::new(true));
         let server = Arc::new(CodexServer {
             child: Mutex::new(child),
+            #[cfg(windows)]
+            job: Mutex::new(Some(job)),
             stdin: Mutex::new(stdin),
             next_id: AtomicI64::new(1),
             pending: Mutex::new(HashMap::new()),
@@ -444,6 +454,8 @@ impl CodexServer {
     }
 
     pub fn kill(&self) {
+        #[cfg(windows)]
+        self.job.lock().unwrap().take();
         let mut child = self.child.lock().unwrap();
         let _ = child.kill();
         let _ = child.wait();
@@ -528,6 +540,8 @@ impl CodexServer {
 
 impl Drop for CodexServer {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Ok(mut job) = self.job.lock() { job.take(); }
         if let Ok(mut c) = self.child.lock() {
             let _ = c.kill();
         }

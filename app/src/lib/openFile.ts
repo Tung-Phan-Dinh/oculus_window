@@ -3,14 +3,25 @@ import { useSidePanelStore } from "@/stores/sidePanelStore";
 import { humanizeSlug } from "@/lib/format";
 import { isPdfBacked } from "@/lib/fileTypes";
 import { getFileByRelativePath, markFileAccessed, type DbFile } from "@/lib/db";
+export { libraryPath } from "@/lib/libraryPath";
 
-/** What the panel header shows: real filenames stay, slugs get prettified.
- *  Takes the two columns it reads rather than a whole row, so the chat's
- *  `@` menu labels files the same way the side panel does. */
+/** Categories whose rows are real files with real filenames — a download, an
+ *  inline image, one of the student's own uploads — as opposed to the Canvas
+ *  documents stored under a slug. */
+const REAL_FILENAME = new Set(["file", "image", "upload"]);
+
+/** What the panel header and chat's `@` menu show: filenames stay intact,
+ *  while Canvas document slugs get prettified. */
 export function fileTitle(file: Pick<DbFile, "category" | "filename">): string {
-  return file.category === "file" || file.category === "image"
+  return REAL_FILENAME.has(file.category ?? "")
     ? file.filename
     : humanizeSlug(file.filename);
+}
+
+/** Binaries without an in-app viewer open in the system's associated app. */
+export function usesSystemViewer(file: Pick<DbFile, "category" | "filename">): boolean {
+  return (file.category === "file" || file.category === "upload")
+    && !isPdfBacked(file.filename);
 }
 
 /** Fired after a file's last_accessed_at is stamped, so open lists refresh. */
@@ -31,29 +42,15 @@ export function recordFileAccess(file: Pick<DbFile, "id">): void {
  */
 export function openFileSmart(file: DbFile): void {
   recordFileAccess(file);
-  if (file.category === "file" && !isPdfBacked(file.filename)) {
+  // An upload can be anything the student had lying around — a zip, a
+  // notebook, a recording — so it takes the same hand-off a download does.
+  if (usesSystemViewer(file)) {
     invoke("open_course_file", { relativePath: file.relative_path }).catch(
       console.error,
     );
     return;
   }
   useSidePanelStore.getState().open({ kind: "file", file });
-}
-
-/**
- * The shape of a path the agent can be talking about: the library paths it is
- * given (`courses/<subject>/…`) and the ones it actually uses, which carry a
- * `../` because every thread runs from `agents/` beside `courses/`.
- *
- * Matched on shape rather than resolved, so a timeline of a hundred tool rows
- * costs no queries — the lookup happens when one is clicked.
- */
-const LIBRARY_PATH = /^(?:\.\.\/)?(courses\/[^\s]+)$/;
-
-/** The library path inside an agent's tool argument, if that is what it is. */
-export function libraryPath(raw: string | null | undefined): string | null {
-  const m = raw ? LIBRARY_PATH.exec(raw.trim()) : null;
-  return m ? m[1] : null;
 }
 
 /**

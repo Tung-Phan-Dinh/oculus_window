@@ -16,11 +16,13 @@ markdown and page-image embeddings. Spawned and supervised by
 | Formula-batch memory cap | `sidecar/mfr_memory.py` |
 | Model workers + JSON-lines transport | `sidecar/quality_worker.py`, `sidecar/embed_worker.py`, `sidecar/worker_client.py`, `sidecar/model_workers.py` |
 | Whole-tree memory governor | `sidecar/memory_governor.py` |
+| Windows process accounting, worker jobs + startup handshake | `sidecar/windows_process.py`, `sidecar/process_runtime.py`, `sidecar/process_bootstrap.py` |
 | Cloud client, limits + quota ledger | `sidecar/mineru_cloud.py` |
 | Cloud batching + backend routing | `sidecar/cloud_batcher.py`, `sidecar/quality_router.py` |
 | Live parse settings | `sidecar/parse_settings.py` |
 | Page-image embeddings (Qwen3-VL) | `sidecar/embedder.py`, `sidecar/embedding_client.py`, `sidecar/embed_contract.py` |
 | Model-init lock | `sidecar/modellock.py` |
+| Windows model-download compatibility | `sidecar/model_downloads.py` |
 | Deps (uv) | `sidecar/pyproject.toml`, `sidecar/uv.lock` |
 | Rust supervisor + live limits | `app/src-tauri/src/sidecar.rs` |
 | MinerU keychain commands | `app/src-tauri/src/mineru.rs` |
@@ -36,9 +38,18 @@ Endpoints: `POST /parse-pdf`, `POST /embed-pdf`, `POST /embed-query`,
 The HTTP parent never imports torch or owns model weights. Each model lives in
 its own lazy, long-lived child, reached over JSON lines. Killing a worker does
 not take down HTTP, queued files, or progress reporting. Workers have their
-own process groups so MinerU's render descendants die with their owner; idle
+own process groups on POSIX and kill-on-close Job Objects on Windows, so
+MinerU's render descendants die with their owner. A Windows bootstrap waits
+until its parent assigns the job before executing worker code, closing the
+startup race where a render child could escape ownership. All worker pipes
+explicitly use UTF-8 and Windows workers launch without console windows. Idle
 workers expire after 15 minutes. The Rust supervisor still owns final shutdown
 of the complete sidecar tree.
+
+Windows workers launch the venv's base interpreter with
+`__PYVENV_LAUNCHER__` pointing back to the venv, preserving its packages while
+avoiding the extra process created by the Windows venv redirector. The actual
+gated interpreter PID is therefore the PID assigned to the worker job.
 
 Rust reads the `settings` key `parse` at spawn and passes the cap/backend as
 environment variables. Frontend changes persist the same record and call
@@ -65,6 +76,23 @@ not a persisted preference.
   (2026-08-15). MinerU is ~100× faster than docling-with-enrichment and more
   correct (1% vs 18% KaTeX render failures on the benchmark deck). Docling
   is fully removed — no fallback path.
+
+### A page is not always page-sized
+
+`render_pages` limits a rendered pixmap to approximately `MAX_RENDER_PIXELS`
+(8 MP, allowing pixel rounding) rather than trusting `RENDER_DPI`. A spreadsheet
+converted with `SinglePageSheets` is one page however many rows it has — a
+300-row sheet measures 3418×3853pt, or 101 MP and 305 MB of RGB at 200 DPI,
+inside a process tree with a memory cap. The processor subsequently downscales
+to `EMBED_MAX_TOKENS` (640 tokens ≈ 0.66 MP). A4 at 200 DPI is 3.9 MP, so
+ordinary pages are never clamped and their rendering is unchanged.
+
+Office conversions keep the original extension in their PDF name:
+`marks.xlsx.pdf` produces `marks.xlsx.pages.json` and `marks.xlsx.emb.json`.
+Both preserve 1-based `page_no` values, keeping each sheet's image vector
+joined to the same sheet's markdown in retrieval. `sidecar/test_embedder.py`
+checks large-page rendering and this join using real PDFs without loading
+model weights.
 
 ### Outputs, per PDF (written beside it)
 
@@ -100,10 +128,25 @@ shared 7.5 GB baseline.
   operation whose irreducible estimate cannot fit fails without starting.
 - The watchdog samples about once a second. On macOS it sums
   `proc_pid_rusage(..., RUSAGE_INFO_V2).ri_phys_footprint`, including render
-  children; other platforms fall back to RSS. This is a sampled protection,
+  children. Windows uses Toolhelp process enumeration and
+  `GetProcessMemoryInfo.WorkingSetSize`, the resident host-RAM measurement
+  corresponding to the POSIX RSS fallback. Windows health labels this metric
+  `working_set`. Shared resident pages can be counted once per process;
+  paged-out allocations are excluded. This differs from the Mac footprint,
+  which also accounts for compressed memory and integrated-GPU allocations.
+  Private commit is available separately for diagnosis: CUDA initialisation
+  was observed to report 11,131 MiB committed while the tree had only
+  1,152 MiB resident. Commit is not a resident-RAM budget.
+  This is a sampled protection,
   not an OS-enforced allocation ceiling: brief overshoot remains possible.
   If the process tree cannot be enumerated, local admission refuses to start
   and health reports incomplete measurement rather than a misleading total.
+- The Windows host-memory total is not a complete GPU-memory measurement:
+  dedicated VRAM and driver-managed shared GPU allocations require separate
+  accounting. CUDA allocator
+  out-of-memory errors also terminate the owning worker and enter the existing
+  smaller local-quality retry rung. Admission estimates remain conservative
+  estimates calibrated on the Mac; they are not a GPU allocation ceiling.
 - At 85%, dead objects/accelerator caches are already reclaimed at local
   chunk boundaries, and the governor evicts idle Qwen. At the hard cap it
   kills the active model owner (or the one-shot fast parser), preserving the
@@ -190,8 +233,9 @@ indexing either. Both measurements used cached weights and no cloud upload.
 
 ## Lifecycle
 
-- `app/src-tauri/src/sidecar.rs` prefers `sidecar/.venv/bin/python3` (created
-  by `uv sync`); with no venv it disables parsing and says so. It reclaims
+- `app/src-tauri/src/sidecar.rs` uses `sidecar/.venv/bin/python3` on macOS and
+  `sidecar/.venv/Scripts/python.exe` on Windows (created by `uv sync`); with no
+  venv it disables parsing and says so. It reclaims
   port 9547 from orphans before spawning, and installs its own exit handlers
   because Ctrl-C / `tauri dev` rebuilds bypass Tauri's Exit event.
 - Progress flows back by the sidecar POSTing to the app's IPC port
@@ -210,10 +254,22 @@ All in `sidecar/pyproject.toml` / `sidecar/mineru_local.py`:
   fast parse into 24s on image-heavy slides.
 - **torch ≥ 2.13 required** — on 2.12, UniMERNet emits out-of-range token
   ids on MPS and the tokenizer raises `OverflowError`.
+- **Windows x64 uses the official CUDA 13.0 torch/torchvision index.** The
+  locked Windows pair is 2.13.0+cu130 / 0.28.0+cu130; plain PyPI torch is
+  CPU-only on Windows. Platform markers leave Mac dependency sources alone.
+  The CUDA build needs an NVIDIA driver supporting CUDA 13.0; it still
+  provides the CPU path on machines without an available CUDA device.
+  `torchvision` is direct so uv applies its matching source selection too.
+  See the [uv PyTorch integration guide](https://docs.astral.sh/uv/guides/integration/pytorch/).
 - **`six` declared explicitly** — MinerU's vendored pytorchocr bare-imports
   it; it used to arrive via docling's dep chain.
 - **`qwen-vl-utils` is not droppable** — the model's own embedding script
   imports `process_vision_info` from it (and it hard-requires PyAV, ~47MB).
+- Windows model workers serialize HuggingFace 0.x's symlink capability probe:
+  parallel first downloads could otherwise observe its provisional `True`
+  and fail with WinError 1314 before the non-admin copy fallback activates.
+  No administrator privileges or Developer Mode are required. The `hf_xet`
+  extra enables native chunked transfers of the multi-GB model files.
 - **`mineru[pipeline]`, not `[core]`** — core drags in gradio, which pins
   starlette down.
 - **MinerU's internal processing window is capped at 8 pages.** Its former
@@ -259,6 +315,10 @@ All in `sidecar/pyproject.toml` / `sidecar/mineru_local.py`:
   flat at ~115 MB, for about 1s of interpreter start per deck.
   `OCULUS_INPROCESS_PARSE=1` restores the old in-process call for profiling;
   it still leaks.
+- Fast image extraction handles Windows usernames and temporary paths with
+  spaces, brackets and Unicode. If no safe absolute scratch path exists, the
+  one-shot parser uses a relative image path from inside its scratch directory
+  and restores its working directory afterward; it does not depend on `/tmp`.
 - **The quality tier does not show cumulative leakage.** Measured
   2026-08-26, 49 sequential parses across three fresh interpreters: RSS ramps
   to a plateau of ~3.0–3.4 GB and then oscillates, with repeated *negative*
@@ -282,6 +342,38 @@ All in `sidecar/pyproject.toml` / `sidecar/mineru_local.py`:
   module-level model warm-up would load a 4GB model per worker.
 
 ## Debugging
+
+On Windows, `uv sync --locked` creates the native Python 3.12 environment.
+Run regressions with `.venv\Scripts\python.exe -m unittest discover -v` from
+`sidecar/`. The Windows lifecycle tests actually create/kill child processes,
+exercise crash recovery and Unicode worker pipes; PDF path tests perform a
+real fast parse and verify page attribution and retained images. No cloud
+credentials or model downloads are needed for this suite.
+
+Validated on Windows with an RTX 4070 (12 GB VRAM), driver 591.86 and Python
+3.12.14: the locked CUDA pair detects the GPU and executes bfloat16 kernels.
+All 34 regressions pass, including a native committed-but-untouched allocation
+test proving the governor counts resident pages, and the touched-memory
+balloon test proving kill/restart still works.
+
+Run the opt-in real-model test with
+`.venv\Scripts\python.exe smoke_local.py ../artifacts` from `sidecar/`, or add
+`--http http://127.0.0.1:9547` to exercise the app-owned sidecar. It creates a
+synthetic two-page PDF with a Unicode/spaced filename, checks fast and local
+quality parsing, embeds both page images, and verifies two queries rank the
+correct pages first. It writes a separate `retrieval.db` and `result.json` in
+a new output subdirectory; it never uses the application's database.
+
+With cached weights, this smoke completed in 19.3 seconds, including a 2.8 s
+Qwen load and 0.9 s for both page embeddings. The default 8192 MiB budget stayed
+unchanged: the governor observed a 7083 MiB resident peak, complete accounting
+and zero kills. These are small-fixture Windows results, not a large-deck
+benchmark. The earlier memory-budget measurements remain Mac measurements.
+
+Windows memory-counter semantics are documented by Microsoft:
+[process counters](https://learn.microsoft.com/en-us/windows/win32/api/psapi/ns-psapi-process_memory_counters_ex),
+[working sets](https://learn.microsoft.com/en-us/windows/win32/memory/working-set),
+and [committed versus physically allocated pages](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualalloc).
 
 **Stdout silence is not a hang.** `main.py` uses bare `print()` and Python
 block-buffers stdout on a pipe (the Tauri spawn sets `PYTHONUNBUFFERED=1`,

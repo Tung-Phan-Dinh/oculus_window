@@ -63,6 +63,9 @@ def _run_mineru(
     """Invoke MinerU and return ``(content_list, produced_dir)``."""
     global _warmed
 
+    from model_downloads import prepare_model_downloads
+
+    prepare_model_downloads()
     from mineru.cli.common import do_parse
 
     def call() -> None:

@@ -327,7 +327,7 @@ export default function SubjectLecturesPage() {
             <DialogTitle>Delete this download?</DialogTitle>
             <DialogDescription>
               {pendingDelete
-                ? `The video file for “${pendingDelete.title}” is removed from this Mac. Your place in it, the transcript and any chapters or recap notes are kept, and you can download it again whenever you want.`
+                ? `The video file for “${pendingDelete.title}” is removed from this device. Your place in it, the transcript and any chapters or recap notes are kept, and you can download it again whenever you want.`
                 : ""}
             </DialogDescription>
           </DialogHeader>

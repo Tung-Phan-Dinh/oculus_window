@@ -1,6 +1,7 @@
 """HTTP/queue/routing contract tests without loading model weights."""
 
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -45,9 +46,25 @@ class QualityRoutingTest(unittest.TestCase):
             self.assertTrue(all(not Path(payload["workspace"]).exists() for payload in payloads))
 
     def test_parent_import_does_not_load_models(self):
-        self.assertNotIn("torch", sys.modules)
-        self.assertNotIn("embedder", sys.modules)
-        self.assertNotIn("mineru.cli.common", sys.modules)
+        # Discovery imports every test module first, including renderer tests
+        # that legitimately import the model worker. The HTTP parent's import
+        # boundary must be measured in a fresh interpreter, just like startup.
+        result = subprocess.run(
+            [sys.executable, "-c", "\n".join([
+                "import sys",
+                "import main",
+                "heavy = ['torch', 'embedder', 'mineru.cli.common']",
+                "loaded = [name for name in heavy if name in sys.modules]",
+                "if loaded: raise RuntimeError('HTTP parent imported model modules: ' + ', '.join(loaded))",
+            ])],
+            cwd=Path(__file__).parent,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
 
     def test_local_never_uploads_even_with_token(self):
         with mock.patch.object(quality_router, "cloud_eligible", return_value=True):

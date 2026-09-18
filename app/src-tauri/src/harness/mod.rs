@@ -24,11 +24,15 @@
 //! `fixtures/harness/` that the bridge tests replay came from exactly this.
 
 pub mod claude;
+#[cfg(windows)]
+pub mod wsl_cli;
 pub mod codex;
 pub mod discover;
 pub mod event;
 pub mod jobs;
 pub mod store;
+#[cfg(windows)]
+pub mod wsl;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -51,6 +55,55 @@ const INSTRUCTIONS_TEMPLATE: &str = include_str!("../../templates/HARNESS.templa
 /// module docs for why this and not the root.
 pub fn thread_cwd(data_dir: &Path) -> PathBuf {
     crate::agents::agents_dir(data_dir)
+}
+
+/// Resolve directories before handing them to a provider. An Oculus process
+/// launched by a packaged Windows app can see a virtualized AppData path that
+/// the provider's sandbox user cannot see. Resolve the actual directories after
+/// creating them, and keep the writable cwd strictly inside that library.
+fn prepare_thread_paths(data_dir: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let cwd = thread_cwd(data_dir);
+    std::fs::create_dir_all(&cwd).map_err(|e| format!("cannot create {}: {e}", cwd.display()))?;
+    #[cfg(windows)]
+    {
+        let library = dunce::canonicalize(data_dir)
+            .map_err(|e| format!("cannot resolve library {}: {e}", data_dir.display()))?;
+        let cwd = dunce::canonicalize(&cwd)
+            .map_err(|e| format!("cannot resolve agent directory {}: {e}", cwd.display()))?;
+        if cwd.parent() != Some(library.as_path()) {
+            return Err("The agent directory must resolve directly inside the Oculus library.".into());
+        }
+        Ok((library, cwd))
+    }
+    #[cfg(not(windows))]
+    Ok((data_dir.to_path_buf(), cwd))
+}
+
+fn child_env_for_library(library: &Path) -> Vec<(String, String)> {
+    let env = discover::child_env();
+    #[cfg(windows)]
+    {
+        windows_library_env(env, library)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = library;
+        env
+    }
+}
+
+#[cfg(windows)]
+fn windows_library_env(mut env: Vec<(String, String)>, library: &Path) -> Vec<(String, String)> {
+    // The nested `oculus` CLI computes APPDATA/com.tchan.oculus. Give only
+    // provider children the physical parent, so that CLI and the sandbox agree
+    // with the app without changing Tauri's own data-directory semantics.
+    if library.file_name() == Some(std::ffi::OsStr::new(crate::paths::IDENTIFIER)) {
+        if let Some(parent) = library.parent() {
+            env.retain(|(key, _)| !key.eq_ignore_ascii_case("APPDATA"));
+            env.push(("APPDATA".into(), parent.to_string_lossy().into_owned()));
+        }
+    }
+    env
 }
 
 /// The instructions appended to the provider's own system prompt, with the
@@ -534,9 +587,10 @@ impl Harness {
             return Ok(s.clone());
         }
         let bin = discover::binary(Provider::Codex)?;
+        let (library, _) = prepare_thread_paths(&self.data_dir)?;
         let server = CodexServer::spawn(CodexSpawn {
             bin,
-            env: discover::child_env(),
+            env: child_env_for_library(&library),
             raw_log: RawLog::open(&self.data_dir, 0),
             account_sink: self.codex_account_sink.lock().unwrap().clone(),
         })?;
@@ -662,10 +716,13 @@ impl Harness {
         {
             return Ok(());
         }
-        live.remove(&thread_id);
+        if let Some(Live::Claude { session, .. }) = live.remove(&thread_id) {
+            // The reader thread owns an Arc too. Removing the manager's
+            // handle alone does not stop the old process or WSL heartbeat.
+            session.kill();
+        }
 
-        let cwd = thread_cwd(&self.data_dir);
-        std::fs::create_dir_all(&cwd).map_err(|e| format!("cannot create {}: {e}", cwd.display()))?;
+        let (library, cwd) = prepare_thread_paths(&self.data_dir)?;
         let raw_log = RawLog::open(&self.data_dir, thread_id);
         let session = match provider {
             Provider::Claude => {
@@ -673,13 +730,13 @@ impl Harness {
                     ClaudeSpawn {
                         bin: discover::binary(provider)?,
                         cwd,
-                        library: self.data_dir.clone(),
+                        library: library.clone(),
                         resume: resume.map(String::from),
                         model: opts.model.clone(),
                         effort: opts.reasoning_effort.clone(),
                         permission_mode: "acceptEdits".into(),
-                        system_append: instructions(&self.data_dir, opts.scope.as_deref(), opts.lecture.as_ref()),
-                        env: discover::child_env(),
+                        system_append: instructions(&library, opts.scope.as_deref(), opts.lecture.as_ref()),
+                        env: child_env_for_library(&library),
                         raw_log,
                     },
                     sink,
@@ -695,7 +752,7 @@ impl Harness {
                     cwd,
                     model: opts.model.clone(),
                     reasoning_effort: opts.reasoning_effort.clone(),
-                    instructions: instructions(&self.data_dir, opts.scope.as_deref(), opts.lecture.as_ref()),
+                    instructions: instructions(&library, opts.scope.as_deref(), opts.lecture.as_ref()),
                 };
                 let tid = match resume {
                     Some(id) => {
@@ -742,7 +799,7 @@ impl Harness {
         let sink: Sink = Arc::new(move |ev| {
             let _ = tx.send(ev);
         });
-        let cwd = thread_cwd(&self.data_dir);
+        let (library, cwd) = prepare_thread_paths(&self.data_dir)?;
 
         // Held so the session outlives the collect loop, and dropped after it.
         let claude;
@@ -753,7 +810,7 @@ impl Harness {
                     ClaudeSpawn {
                         bin: discover::binary(provider)?,
                         cwd,
-                        library: self.data_dir.clone(),
+                        library: library.clone(),
                         resume: None,
                         model: Some(sel.model.clone()),
                         effort: sel.reasoning_effort.clone(),
@@ -762,7 +819,7 @@ impl Harness {
                         // refused rather than hanging the turn.
                         permission_mode: "default".into(),
                         system_append: String::new(),
-                        env: discover::child_env(),
+                        env: child_env_for_library(&library),
                         raw_log: None,
                     },
                     sink,
@@ -1467,6 +1524,44 @@ pub mod app {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_bridge_uses_the_created_physical_agents_directory() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir()
+            .join(format!("oculus-harness-paths-{}-{nonce}", std::process::id()));
+        let logical = root.join(crate::paths::IDENTIFIER);
+        let (library, cwd) = prepare_thread_paths(&logical).unwrap();
+        assert!(library.is_absolute());
+        assert_eq!(library, dunce::canonicalize(&logical).unwrap());
+        assert_eq!(cwd, library.join("agents"));
+        assert!(cwd.is_dir());
+        assert!(instructions(&library, None, None).contains(&library.display().to_string()));
+        std::fs::remove_dir(&cwd).unwrap();
+        std::fs::remove_dir(&library).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_bridge_cli_receives_the_same_library_without_changing_other_environment() {
+        let env = windows_library_env(
+            vec![
+                ("AppData".into(), "C:\\logical\\Roaming".into()),
+                ("APPDATA".into(), "C:\\another\\Roaming".into()),
+                ("HOME".into(), "C:\\Users\\student".into()),
+            ],
+            Path::new(r"C:\physical\Roaming\com.tchan.oculus"),
+        );
+        assert_eq!(env, vec![
+            ("HOME".into(), "C:\\Users\\student".into()),
+            ("APPDATA".into(), "C:\\physical\\Roaming".into()),
+        ]);
+        let unrelated = vec![("APPDATA".into(), "original".into())];
+        assert_eq!(windows_library_env(unrelated.clone(), Path::new(r"C:\custom-library")), unrelated);
+    }
 
     /// A model asked for a name alone mostly gives one, and sometimes dresses
     /// it up. What it dresses it in is stripped; a whole sentence is refused,

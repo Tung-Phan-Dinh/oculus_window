@@ -22,8 +22,8 @@ import { useTabStore } from "@/stores/tabStore";
 import { useSubjects } from "@/hooks/useSubjects";
 import { filePagePath } from "@/components/panel/FilePanel";
 import { SubjectIcon } from "@/components/subjects/SubjectIcon";
-import { categoryIconFor, isPdfBacked } from "@/lib/fileTypes";
-import { fileTitle, openFileSmart } from "@/lib/openFile";
+import { categoryIconFor } from "@/lib/fileTypes";
+import { fileTitle, openFileSmart, usesSystemViewer } from "@/lib/openFile";
 import { fmtLectureDate, lecturePagePath } from "@/lib/lectures";
 import { displayCode, displayName } from "@/lib/format";
 import {
@@ -34,6 +34,7 @@ import {
   type Subject,
 } from "@/lib/db";
 import { cn } from "@/lib/utils";
+import { shortcut } from "@/lib/platform";
 
 const FILE_LIMIT = 8;
 const LECTURE_LIMIT = 4;
@@ -176,9 +177,9 @@ function PaletteBody({ onClose }: { onClose: () => void }) {
         icon: <Icon size={15} className="shrink-0 text-muted-foreground" />,
         label: fileTitle(f),
         meta: displayCode(f.subject_code),
-        // A binary we cannot render — a .zip, a .xlsx — has no page to go to,
+        // A binary we cannot render — a .zip, a .mp3 — has no page to go to,
         // so it leaves for the system viewer the way any list row does.
-        ...(f.category === "file" && !isPdfBacked(f.filename)
+        ...(usesSystemViewer(f)
           ? { run: () => openFileSmart(f) }
           : { path: filePagePath(f.subject_id, f.relative_path) }),
       };
@@ -347,7 +348,7 @@ function PaletteBody({ onClose }: { onClose: () => void }) {
 
       <div className="flex items-center gap-3 border-t border-border-subtle px-4 py-2 text-[11px] text-muted-foreground">
         <Hint keys="↵" label="Open" />
-        <Hint keys="⌘ ↵" label="Open in new tab" />
+        <Hint keys={shortcut("Enter")} label="Open in new tab" />
         <Hint keys="esc" label="Close" />
       </div>
     </div>

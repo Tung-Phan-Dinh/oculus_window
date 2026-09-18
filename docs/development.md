@@ -1,5 +1,10 @@
 # Development
 
+For this Windows checkout, begin with [windows.md](./windows.md). Use Bun,
+Rust MSVC, Visual Studio C++ Build Tools + Windows SDK, sccache and uv. The
+Windows config is merged automatically by Tauri. macOS notes below describe
+the upstream build.
+
 ## Prerequisites
 
 - **bun** (never npm/yarn/pnpm — see root `CLAUDE.md`)
@@ -14,6 +19,8 @@
 cd app
 bun install
 bun run ffmpeg        # fetches the ffmpeg binary into src-tauri/binaries/
+bun run prepare-sidecar # stages Windows sources and uv
+bun run stage-cli     # required once before a clean tauri dev
 cd ../sidecar
 uv sync               # creates .venv (~1.2GB — that is the floor, mostly torch)
 ```
@@ -26,7 +33,7 @@ bun run tauri dev     # full desktop app (spawns the sidecar itself)
 bun run dev           # vite only, browser — no Tauri APIs, limited use
 bun run tauri build   # release build
 bun run cli           # build the headless `oculus` binary
-bun run cli:install   # + symlink into ~/.local/bin
+bun run cli:install   # + copy on Windows / symlink on Unix into ~/.local/bin
 bun run stage-cli     # build it and stage it as a sidecar for the bundle
 bun run docs:cli      # regenerate docs/cli-reference.md from the binary's help
 ```

@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.tchan.oculus",
   "build": {
-    "beforeDevCommand": "bun run ffmpeg && bun run dev",
+    "beforeDevCommand": "bun run prepare-sidecar && bun run ffmpeg && bun run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "bun run ffmpeg && bun run stage-cli && bun run docs:cli && bun run build",
+    "beforeBuildCommand": "bun run prepare-sidecar && bun run ffmpeg && bun run stage-cli && bun run docs:cli && bun run build",
     "frontendDist": "../dist"
   },
   "app": {

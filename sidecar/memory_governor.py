@@ -4,6 +4,9 @@ macOS has no cgroup equivalent for this service and torch/Metal maps virtual
 regions far larger than their physical cost. The governor therefore samples
 ``ri_phys_footprint`` — the value jetsam acts on — for the sidecar and every
 descendant, and terminates a model worker when the tree crosses the hard cap.
+Windows measures resident host RAM (WorkingSetSize), matching the POSIX RSS
+fallback. Private commit is not resident RAM: CUDA initialisation can commit
+many GiB without making those pages resident.
 """
 
 from __future__ import annotations
@@ -71,7 +74,11 @@ if sys.platform == "darwin":
 
 
 def physical_footprint(pid: int) -> int | None:
-    """Return macOS physical footprint, falling back to RSS elsewhere."""
+    """macOS physical footprint, Windows resident working set, or POSIX RSS."""
+    if os.name == "nt":
+        from windows_process import working_set_bytes
+
+        return working_set_bytes(pid)
     if _libproc is not None:
         # rusage_info_v2 is larger than this; only ri_phys_footprint at offset
         # 72 is needed. A generous buffer keeps this stable across SDK versions.
@@ -92,6 +99,10 @@ def physical_footprint(pid: int) -> int | None:
 
 
 def process_parents() -> dict[int, int]:
+    if os.name == "nt":
+        from windows_process import process_parents as windows_parents
+
+        return windows_parents()
     try:
         output = subprocess.check_output(
             ["ps", "-eo", "pid=,ppid="],
@@ -144,12 +155,27 @@ def sample_tree(root: int, extra_pids: tuple[int, ...] = ()) -> TreeSnapshot:
         for pid in pids
         if (footprint := physical_footprint(pid)) is not None
     }
-    return TreeSnapshot(sum(by_pid.values()), by_pid, parents, root in parents)
+    complete = root in parents and root in by_pid
+    if os.name == "nt":
+        from windows_process import is_running
+
+        # A child can exit between enumeration and measurement. Inaccessible
+        # children still alive must not silently disappear from the budget.
+        complete = complete and not any(
+            is_running(pid) for pid in pids if pid not in by_pid
+        )
+    return TreeSnapshot(sum(by_pid.values()), by_pid, parents, complete)
 
 
 def terminate_tree(root: int, *, force: bool = True) -> None:
     """Terminate descendants before their parent so none are orphaned."""
     children = descendant_pids(root)
+    if os.name == "nt":
+        from windows_process import terminate_owned_tree, terminate_pids
+
+        if not terminate_owned_tree(root):
+            terminate_pids([*reversed(children), root])
+        return
     sig = signal.SIGKILL if force else signal.SIGTERM
     for pid in reversed(children):
         try:
@@ -381,5 +407,8 @@ class MemoryGovernor:
                 "kills": self._kills,
                 "last_kill": self._last_kill,
                 "measurement_complete": self._snapshot.complete,
-                "metric": "phys_footprint" if _libproc is not None else "rss",
+                "metric": (
+                    "working_set" if os.name == "nt" else
+                    "phys_footprint" if _libproc is not None else "rss"
+                ),
             }

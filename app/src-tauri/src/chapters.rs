@@ -30,7 +30,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 /// 160×90, one byte per pixel — the frame geometry the ffmpeg command below
@@ -113,7 +113,7 @@ pub fn sample_diffs(
     video: &Path,
     mut on_frame: impl FnMut(u32),
 ) -> Result<Vec<(u32, f32)>, String> {
-    let mut child = Command::new(ffmpeg)
+    let mut child = crate::platform::command(ffmpeg)
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(video)
         .args([
@@ -402,7 +402,7 @@ pub fn extract_frames(
 /// for is the one everything else refers to.
 pub fn grab_frame(ffmpeg: &Path, video: &Path, second: u32, out: &Path) -> Result<(), String> {
     let at = best_offset(ffmpeg, video, second);
-    let status = Command::new(ffmpeg)
+    let status = crate::platform::command(ffmpeg)
         .args(["-v", "error", "-nostdin", "-y", "-ss", &at.to_string(), "-i"])
         .arg(video)
         .args(["-frames:v", "1", "-vf", "scale=768:-2", "-q:v", "3"])
@@ -456,7 +456,7 @@ fn pick_offset(probed: &[(u32, f32)]) -> Option<u32> {
 /// which is all this has to separate. `None` means ffmpeg produced no frame —
 /// past the end of the recording, normally.
 fn frame_detail(ffmpeg: &Path, video: &Path, second: u32) -> Option<f32> {
-    let out = Command::new(ffmpeg)
+    let out = crate::platform::command(ffmpeg)
         .args(["-v", "error", "-nostdin", "-ss", &second.to_string(), "-i"])
         .arg(video)
         .args([

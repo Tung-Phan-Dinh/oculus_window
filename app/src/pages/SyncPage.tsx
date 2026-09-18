@@ -25,7 +25,6 @@ import {
   getSyncRunSummaries,
   getPdfPipelineRows,
   setParseStatusByPath,
-  setSubjectSelected,
   addLog,
   type CanvasCourseRaw,
   type Subject,
@@ -33,6 +32,7 @@ import {
 } from "@/lib/db";
 import { embedFile, embedPending } from "@/lib/retrieval";
 import { triggerSync } from "@/lib/syncRunner";
+import { SUBJECT_SELECTION_CHANGED_EVENT, subjectSelectionWrites } from "@/lib/subjectSelection";
 import { fmtAgo, sqliteUtcToMs } from "@/lib/format";
 import { useAuth } from "@/hooks/useAuth";
 import { useSyncStore } from "@/stores/syncStore";
@@ -69,6 +69,7 @@ export default function SyncPage() {
   const { status: authStatus, connect } = useAuth();
   const [subjects, setSubjects] = useState<Subject[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const loadVersion = useRef(0);
   const [loadingSubjects, setLoadingSubjects] = useState(false);
   const [subjectsError, setSubjectsError] = useState<string | null>(null);
   const [runs, setRuns] = useState<SyncRunSummary[]>([]);
@@ -99,19 +100,36 @@ export default function SyncPage() {
   // ── Boot ──────────────────────────────────────────────────────────────────
 
   const loadFromDb = useCallback(async () => {
-    const [rows, runRows] = await Promise.all([
-      getSubjects(),
-      getSyncRunSummaries(),
-    ]);
-    setSubjects(rows);
-    setRuns(runRows);
-    // Selection lives in the DB (subjects.selected), so it survives leaving
-    // the tab and app restarts.
-    setSelectedIds(new Set(rows.filter((s) => s.selected).map((s) => s.id)));
+    const request = ++loadVersion.current;
+    try {
+      for (;;) {
+        const revision = subjectSelectionWrites.revision;
+        const [rows, runRows] = await Promise.all([
+          getSubjects(),
+          getSyncRunSummaries(),
+        ]);
+        if (request !== loadVersion.current) return;
+        const selected = subjectSelectionWrites.reconcile(rows, revision);
+        if (selected === null) continue;
+        setSubjects(rows);
+        setRuns(runRows);
+        setSelectedIds(selected);
+        setSubjectsError((previous) => previous?.startsWith("Could not read the library:") ? null : previous);
+        return;
+      }
+    } catch (reason) {
+      if (request === loadVersion.current) setSubjectsError(`Could not read the library: ${String(reason)}`);
+    }
   }, []);
 
   useEffect(() => {
-    loadFromDb();
+    const reload = () => { void loadFromDb(); };
+    window.addEventListener(SUBJECT_SELECTION_CHANGED_EVENT, reload);
+    reload();
+    return () => {
+      window.removeEventListener(SUBJECT_SELECTION_CHANGED_EVENT, reload);
+      loadVersion.current++;
+    };
   }, [loadFromDb]);
 
   // While a run is scraping, keep the history table's counts live.
@@ -267,6 +285,7 @@ export default function SyncPage() {
     setView("history");
 
     try {
+      await subjectSelectionWrites.drain();
       await triggerSync("manual");
       await getSyncRunSummaries().then(setRuns);
     } catch (err) {
@@ -336,15 +355,15 @@ export default function SyncPage() {
   }, [resumeItem]);
 
   const toggleSubject = (id: number) => {
-    const nowSelected = !selectedIds.has(id);
+    const nowSelected = !subjectSelectionWrites.selected(id, selectedIds.has(id));
     setSelectedIds((prev) => {
       const next = new Set(prev);
       nowSelected ? next.add(id) : next.delete(id);
       return next;
     });
-    setSubjectSelected(id, nowSelected).catch((e) =>
-      console.error("persist subject selection failed", e),
-    );
+    subjectSelectionWrites.set(id, nowSelected).catch((reason) => {
+      setSubjectsError(`Could not save subject selection: ${String(reason)}`);
+    });
   };
 
   // ── Derived ───────────────────────────────────────────────────────────────

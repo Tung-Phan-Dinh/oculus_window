@@ -13,6 +13,9 @@ live in the root `CLAUDE.md`, not here.
 
 ## Reading order
 
+Windows setup, packaging, platform boundaries and the upstream update workflow
+are in [windows.md](./windows.md).
+
 | Page | What it covers |
 | --- | --- |
 | [architecture.md](./architecture.md) | The three processes, how they talk, the data directory, `oculus.db` |

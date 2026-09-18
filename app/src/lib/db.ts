@@ -1,7 +1,10 @@
 import Database from "@tauri-apps/plugin-sql";
+import { invoke } from "@tauri-apps/api/core";
 
 import type { Provider } from "@/lib/harness";
-import { compareTermsNewestFirst, TERM_RANK_SQL } from "@/lib/terms";
+import { PDF_BACKED_SQL_LIST } from "@/lib/fileTypes";
+import { currentSubjectIds, hasLegacyDefaultSelection, TERM_RANK_SQL } from "@/lib/terms";
+import { isWindows } from "@/lib/platform";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -97,11 +100,13 @@ export interface DbFile {
 
 // ── Singleton ────────────────────────────────────────────────────────────────
 
-let _db: Database | null = null;
+let _db: Promise<Database> | null = null;
 
 export async function getDb(): Promise<Database> {
   if (!_db) {
-    _db = await Database.load("sqlite:oculus.db");
+    _db = (isWindows ? invoke<string>("library_database_url") : Promise.resolve("sqlite:oculus.db"))
+      .then((url) => Database.load(url))
+      .catch((error) => { _db = null; throw error; });
   }
   return _db;
 }
@@ -119,6 +124,14 @@ export interface CanvasCourseRaw {
 
 export async function upsertSubjects(courses: CanvasCourseRaw[]): Promise<void> {
   const db = await getDb();
+  // Repair obsolete defaults before fresh metadata replaces the evidence in
+  // is_current. Explicit selections survive both this repair and the upsert.
+  await getSubjects();
+  const currentIds = currentSubjectIds(courses.map((c) => ({
+    id: c.id,
+    term_name: c.term?.name ?? null,
+    workflow_state: c.workflow_state,
+  })));
   for (const c of courses) {
     await db.execute(
       `INSERT INTO subjects (id, code, name, term_name, is_current, workflow_state, selected)
@@ -133,11 +146,11 @@ export async function upsertSubjects(courses: CanvasCourseRaw[]): Promise<void> 
         c.course_code,
         c.name,
         c.term?.name ?? null,
-        c._oculus_is_current ? 1 : 0,
+        currentIds.has(c.id) ? 1 : 0,
         c.workflow_state,
         // New subjects start selected only if current; ON CONFLICT leaves the
         // stored (user-chosen) selection untouched.
-        c._oculus_is_current ? 1 : 0,
+        currentIds.has(c.id) ? 1 : 0,
       ]
     );
   }
@@ -160,24 +173,34 @@ export async function getSubjects(): Promise<Subject[]> {
               s.name ASC`
   );
 
-  // `is_current` is derived here rather than read from the column. The stored
-  // flag is stamped at sync time by `list_courses` in `sync.rs`, which picks
-  // the newest term with `.max()` over term *names* — and "2026 Summer Term"
-  // beats "2026 Semester 2" as a string while running six months earlier. So
-  // an enrolment in a summer subject silently marks the whole real semester
-  // as past. Recomputing from `terms.ts` costs one pass and cannot go stale
-  // between syncs; the column stays for Rust's own use.
-  const latest = rows
-    .filter((r) => r.workflow_state === "available")
-    .reduce<string | null>(
-      (best, r) => (compareTermsNewestFirst(r.term_name, best) < 0 ? r.term_name : best),
-      null,
-    );
+  const currentIds = currentSubjectIds(rows);
+  const repairSelection = hasLegacyDefaultSelection(rows, currentIds);
+  if (rows.some((r) => !!r.is_current !== currentIds.has(r.id))) {
+    const ids = [...currentIds];
+    const currentSql = ids.length > 0
+      ? `CASE WHEN id IN (${ids.map((_, i) => `$${i + 1}`).join(", ")}) THEN 1 ELSE 0 END`
+      : "0";
+    if (repairSelection) {
+      // One statement, guarded against a checkbox write after the read above.
+      // SQLite evaluates this uncorrelated subquery once for the statement.
+      await db.execute(
+        `UPDATE subjects SET selected = ${currentSql}
+         WHERE NOT EXISTS (SELECT 1 FROM subjects WHERE selected != is_current)`,
+        ids,
+      );
+    }
+    await db.execute(`UPDATE subjects SET is_current = ${currentSql}`, ids);
+    if (repairSelection) {
+      const saved = await db.select<{ id: number; selected: number }[]>(`SELECT id, selected FROM subjects`);
+      const selection = new Map(saved.map((r) => [r.id, !!r.selected]));
+      rows.forEach((r) => { r.selected = selection.get(r.id) ?? r.selected; });
+    }
+  }
 
   return rows
     .map((r) => ({
       ...r,
-      is_current: r.workflow_state === "available" && r.term_name === latest,
+      is_current: currentIds.has(r.id),
       selected: !!r.selected,
     }))
     // Current term first, then the newest-first order the query already put
@@ -470,7 +493,9 @@ export const JOBS: { id: JobId; label: string; description: string }[] = [
 export const DEFAULT_JOB_MODELS: JobModels = {
   lectureChapters: { provider: "codex", model: "gpt-5.6-luna", reasoningEffort: "xhigh" },
   lectureRecap: { provider: "codex", model: "gpt-5.6-luna", reasoningEffort: "medium" },
-  threadNaming: { provider: "claude", model: "claude-haiku-4-5", reasoningEffort: "low" },
+  threadNaming: isWindows
+    ? { provider: "codex", model: "gpt-5.6-luna", reasoningEffort: "low" }
+    : { provider: "claude", model: "claude-haiku-4-5", reasoningEffort: "low" },
 };
 
 const JOB_MODELS_KEY = "job_models";
@@ -786,6 +811,18 @@ export async function resetFilePipeline(
   );
 }
 
+/** Remove an upload's row and indexed pages. Explicit page deletion also works
+ *  on SQLite connections without foreign-key enforcement. */
+export async function deleteFileRow(id: number): Promise<void> {
+  const db = await getDb();
+  await db.execute(
+    `DELETE FROM pages WHERE file_id IN
+       (SELECT id FROM files WHERE id = $1 AND category = 'upload')`,
+    [id],
+  );
+  await db.execute(`DELETE FROM files WHERE id = $1 AND category = 'upload'`, [id]);
+}
+
 export async function markFileAccessed(id: number): Promise<void> {
   const db = await getDb();
   await db.execute(`UPDATE files SET last_accessed_at = datetime('now') WHERE id = $1`, [id]);
@@ -999,7 +1036,7 @@ export async function getPdfPipelineRows(): Promise<PdfPipelineRow[]> {
     `SELECT subject_id, relative_path, parse_status, embed_status,
             scraped_at, parsed_at, embedded_at
      FROM files
-     WHERE lower(file_type) IN ('pdf', 'pptx', 'docx', 'ppt', 'doc')
+     WHERE lower(file_type) IN ${PDF_BACKED_SQL_LIST}
      ORDER BY relative_path ASC`,
   );
 }

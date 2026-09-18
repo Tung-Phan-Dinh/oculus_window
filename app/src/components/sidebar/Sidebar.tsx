@@ -13,6 +13,7 @@ import {
 import { anyRunning, useHarnessStore } from "@/stores/harnessStore";
 import { usePaletteStore } from "@/stores/paletteStore";
 import { cn } from "@/lib/utils";
+import { shortcut } from "@/lib/platform";
 import NavItem from "./NavItem";
 import SubjectsNavGroup from "./SubjectsNavGroup";
 import RecentNavGroup from "./RecentNavGroup";
@@ -110,7 +111,7 @@ export default function Sidebar({ collapsed, onToggle }: SidebarProps) {
             </TooltipTrigger>
             <TooltipContent side="bottom" align="end" className="flex flex-col items-start gap-0.5">
               Close sidebar
-              <span className="text-[11px] text-background/60">⌘B</span>
+              <span className="text-[11px] text-background/60">{shortcut("B")}</span>
             </TooltipContent>
           </Tooltip>
         </div>
@@ -183,7 +184,7 @@ function SearchItem() {
         Search
       </span>
       <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground/60">
-        ⌘K
+        {shortcut("K")}
       </span>
     </button>
   );

@@ -9,11 +9,15 @@
  */
 import { invoke } from "@tauri-apps/api/core";
 import { getDb, getSetting } from "@/lib/db";
+import { isWindows } from "@/lib/platform";
 
 export type Provider = "claude" | "codex";
 
 export const PROVIDERS: { id: Provider; label: string }[] = [
-  { id: "claude", label: "Claude Code" },
+  {
+    id: "claude",
+    label: isWindows ? "Claude Code via WSL2" : "Claude Code",
+  },
   { id: "codex", label: "Codex" },
 ];
 
