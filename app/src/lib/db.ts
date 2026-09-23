@@ -1,7 +1,12 @@
 import Database from "@tauri-apps/plugin-sql";
 import { invoke } from "@tauri-apps/api/core";
 
-import type { Provider } from "@/lib/harness";
+// `harness.ts` imports `getDb`/`getSetting` back from here, so these two are a
+// cycle. It is safe only because `isProvider` is *called* inside a function
+// body: hoist the check to module scope — the tempting
+// `new Set(PROVIDERS.map(…))` — and whichever module evaluates second reads
+// `PROVIDERS` in its TDZ and throws at import time.
+import { isProvider, type Provider } from "@/lib/harness";
 import { PDF_BACKED_SQL_LIST } from "@/lib/fileTypes";
 import { currentSubjectIds, hasLegacyDefaultSelection, TERM_RANK_SQL } from "@/lib/terms";
 import { isWindows } from "@/lib/platform";
@@ -260,188 +265,19 @@ export async function setSyncOptions(options: SyncOptions): Promise<void> {
 }
 
 // ── Parse settings ───────────────────────────────────────────────────────────
-
-export type ParseBackend = "local" | "cloud" | "auto";
-
-/** Mirrors the sidecar's live `/limits` state. The memory cap is for the whole
- * sidecar process tree, not each worker independently. */
-export interface ParseSettings {
-  memoryCapMb: number;
-  backend: ParseBackend;
-}
-
-export const DEFAULT_PARSE_SETTINGS: ParseSettings = {
-  memoryCapMb: 8192,
-  backend: "local",
-};
-
-const PARSE_SETTINGS_KEY = "parse";
-
-export async function getParseSettings(): Promise<ParseSettings> {
-  const raw = await getSetting(PARSE_SETTINGS_KEY);
-  if (!raw) return { ...DEFAULT_PARSE_SETTINGS };
-  try {
-    const parsed = JSON.parse(raw);
-    const cap = Number(parsed.memoryCapMb);
-    return {
-      memoryCapMb: Math.max(
-        5120,
-        Number.isSafeInteger(cap) && cap > 0 ? cap : DEFAULT_PARSE_SETTINGS.memoryCapMb,
-      ),
-      backend: ["local", "cloud", "auto"].includes(parsed.backend)
-        ? parsed.backend
-        : DEFAULT_PARSE_SETTINGS.backend,
-    } as ParseSettings;
-  } catch {
-    return { ...DEFAULT_PARSE_SETTINGS };
-  }
-}
-
-export async function setParseSettings(settings: ParseSettings): Promise<void> {
-  await setSetting(PARSE_SETTINGS_KEY, JSON.stringify(settings));
-}
-
-// ── LLM settings ─────────────────────────────────────────────────────────────
-
-export type LlmProviderKind =
-  | "ollama"
-  | "lmstudio"
-  | "openrouter"
-  | "opencode-go"
-  | "custom";
-
-/** How many models the fallback chain holds — mirrors `MAX_FALLBACKS` in
- *  `app/src-tauri/src/llm.rs`. Adding past it drops the last one. */
-export const MAX_FALLBACKS = 5;
-
-/** One configured endpoint. `id` is generated once and never changes: it is
- *  the keychain account holding that provider's key. */
-export interface LlmProvider {
-  id: string;
-  kind: LlmProviderKind;
-  label: string;
-  /** Overrides the kind's default base URL; required for `custom`. */
-  baseUrl: string | null;
-}
-
-/** A model in the library. Provider and model id together — the same model id
- *  can be served by two providers. */
-export interface ModelRef {
-  providerId: string;
-  model: string;
-}
-
-/** Mirrors `LlmConfig` in `app/src-tauri/src/llm.rs` (serde camelCase) — Rust
- *  reads the same JSON headlessly to make model calls. API keys are NOT here:
- *  they live in the macOS keychain, reachable only through the llm_* commands. */
-export interface LlmSettings {
-  providers: LlmProvider[];
-  /** The curated models; every picker in the app chooses from this list. */
-  library: ModelRef[];
-  chatModel: ModelRef | null;
-  /** Tried in order when the chosen model cannot run. */
-  fallbacks: ModelRef[];
-  limits: {
-    monthlyUsd: number | null;
-    monthlyTokens: number | null;
-  };
-}
-
-export const DEFAULT_LLM_SETTINGS: LlmSettings = {
-  providers: [],
-  library: [],
-  chatModel: null,
-  fallbacks: [],
-  limits: { monthlyUsd: null, monthlyTokens: null },
-};
-
-const LLM_SETTINGS_KEY = "llm";
-
-/** Every kind the client understands, in the order the Add dialog lists them.
- *  `addable: false` keeps a kind rendering and resolving for a config that
- *  already names it without offering it to new ones. */
-export const PROVIDER_KINDS: {
-  kind: LlmProviderKind;
-  label: string;
-  needsKey: boolean;
-  addable: boolean;
-}[] = [
-  { kind: "opencode-go", label: "OpenCode Go", needsKey: true, addable: true },
-  { kind: "openrouter", label: "OpenRouter", needsKey: true, addable: true },
-  { kind: "ollama", label: "Ollama", needsKey: false, addable: true },
-  { kind: "custom", label: "Custom", needsKey: true, addable: true },
-  { kind: "lmstudio", label: "LM Studio", needsKey: false, addable: false },
-];
-
-/** What Add provider offers: three presets worth having, then Custom for
- *  everything else. LM Studio is not among them — it is Custom with a
- *  localhost URL, and a short list is the point. */
-export const ADDABLE_PROVIDER_KINDS = PROVIDER_KINDS.filter((p) => p.addable);
-
-export const providerNeedsKey = (kind: LlmProviderKind) =>
-  PROVIDER_KINDS.find((p) => p.kind === kind)?.needsKey ?? true;
-
-/** Stable string form of a model ref, for React keys and `<Select>` values. */
-// The separator is a literal NUL, written as an escape: a raw one in the
-// source makes every grep treat this file as binary.
-export const modelKey = (m: ModelRef) => `${m.providerId}\u0000${m.model}`;
-export const sameModel = (a: ModelRef | null, b: ModelRef | null) =>
-  a != null && b != null && a.providerId === b.providerId && a.model === b.model;
-
-/** Settings written before multi-provider support: one provider, three bare
- *  model names. Upgraded on read (Rust does the same in `load_config`); the
- *  first edit in Settings → AI writes the new shape back. The synthesised
- *  provider id equals the old provider name, so its keychain key still works. */
-function migrateLegacy(parsed: any): LlmSettings {
-  const kind: LlmProviderKind = parsed.provider ?? "ollama";
-  const provider: LlmProvider = {
-    id: kind,
-    kind,
-    label: PROVIDER_KINDS.find((p) => p.kind === kind)?.label ?? "Custom",
-    baseUrl: parsed.baseUrl ?? null,
-  };
-  const ref = (name: unknown): ModelRef | null =>
-    typeof name === "string" && name.trim()
-      ? { providerId: provider.id, model: name }
-      : null;
-  const chatModel = ref(parsed.chatModel);
-  const fallback = ref(parsed.fallbackModel);
-
-  const library: ModelRef[] = [];
-  for (const m of [chatModel, fallback]) {
-    if (m && !library.some((l) => sameModel(l, m))) library.push(m);
-  }
-
-  return {
-    providers: [provider],
-    library,
-    chatModel,
-    fallbacks: fallback ? [fallback] : [],
-    limits: { ...DEFAULT_LLM_SETTINGS.limits, ...(parsed.limits ?? {}) },
-  };
-}
-
-export async function getLlmSettings(): Promise<LlmSettings> {
-  const raw = await getSetting(LLM_SETTINGS_KEY);
-  if (!raw) return structuredClone(DEFAULT_LLM_SETTINGS);
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed.providers) || parsed.providers.length === 0) {
-      return migrateLegacy(parsed);
-    }
-    return {
-      ...DEFAULT_LLM_SETTINGS,
-      ...parsed,
-      limits: { ...DEFAULT_LLM_SETTINGS.limits, ...(parsed.limits ?? {}) },
-    };
-  } catch {
-    return structuredClone(DEFAULT_LLM_SETTINGS);
-  }
-}
-
-export async function setLlmSettings(settings: LlmSettings): Promise<void> {
-  await setSetting(LLM_SETTINGS_KEY, JSON.stringify(settings));
-}
+//
+// The `parse` settings row is **owned by Rust now** and has no reader here.
+// It used to carry `memoryCapMb` and a `local`/`cloud`/`auto` backend choice,
+// both of which described the Python sidecar: a memory cap over a process
+// tree that no longer exists, and a local parser that left with it. What
+// remains in the row is `engine`/`engineUrl`, read by `parse::parse_config`
+// in `app/src-tauri/src/parse/mod.rs`, which is where the seam belongs — the
+// thing that selects a backend and the thing that talks to it are one module.
+//
+// The stale keys are deliberately left in the blob rather than migrated out:
+// `StoredParseSettings` ignores what it does not name, so they cost nothing,
+// and a migration that rewrote every install's settings row to delete two
+// dead fields would be more risk than the tidiness is worth.
 
 // ── Per-job models ───────────────────────────────────────────────────────────
 //
@@ -453,7 +289,7 @@ export async function setLlmSettings(settings: LlmSettings): Promise<void> {
 /** A job's key in the stored object. Mirrors `Job` in
  *  `app/src-tauri/src/harness/jobs.rs`; adding one is a key here, a variant
  *  there, and a row in `JOBS` below. */
-export type JobId = "lectureChapters" | "lectureRecap" | "threadNaming";
+export type JobId = "lectureChapters" | "lectureReading" | "threadNaming";
 
 /** What one job runs on. `reasoningEffort` is null only for a model that
  *  takes no level — never "whatever the agent defaults to". */
@@ -474,10 +310,10 @@ export const JOBS: { id: JobId; label: string; description: string }[] = [
       "Reads a recording's slide frames and transcript and names its topics. One long turn, eight to eleven minutes.",
   },
   {
-    id: "lectureRecap",
-    label: "Lecture recap",
+    id: "lectureReading",
+    label: "Lecture reading copy",
     description:
-      "Writes a short note for each visual change, using the slide frame and what was said over it.",
+      "Rewrites the transcript as readable text — one sentence per line, pinned to its second, with spoken maths set as maths. One agent turn per ten minutes.",
   },
   {
     id: "threadNaming",
@@ -492,7 +328,7 @@ export const JOBS: { id: JobId; label: string; description: string }[] = [
  *  be the one that resolves it. */
 export const DEFAULT_JOB_MODELS: JobModels = {
   lectureChapters: { provider: "codex", model: "gpt-5.6-luna", reasoningEffort: "xhigh" },
-  lectureRecap: { provider: "codex", model: "gpt-5.6-luna", reasoningEffort: "medium" },
+  lectureReading: { provider: "codex", model: "gpt-5.6-luna", reasoningEffort: "medium" },
   threadNaming: isWindows
     ? { provider: "codex", model: "gpt-5.6-luna", reasoningEffort: "low" }
     : { provider: "claude", model: "claude-haiku-4-5", reasoningEffort: "low" },
@@ -500,9 +336,9 @@ export const DEFAULT_JOB_MODELS: JobModels = {
 
 const JOB_MODELS_KEY = "job_models";
 
-/** Tolerant like `getLlmSettings`: a job whose stored row is missing, gutted
- *  or from an older build falls back to its default rather than leaving a
- *  picker with nothing selected. */
+/** Tolerant on read: a job whose stored row is missing, gutted or from an
+ *  older build falls back to its default rather than leaving a picker with
+ *  nothing selected. */
 export async function getJobModels(): Promise<JobModels> {
   const raw = await getSetting(JOB_MODELS_KEY);
   if (!raw) return structuredClone(DEFAULT_JOB_MODELS);
@@ -512,7 +348,11 @@ export async function getJobModels(): Promise<JobModels> {
     for (const job of JOBS) {
       const row = parsed?.[job.id];
       if (!row || typeof row.model !== "string" || !row.model.trim()) continue;
-      if (row.provider !== "claude" && row.provider !== "codex") continue;
+      // Off `PROVIDERS`, never a hardcoded pair: spelled out, the test was
+      // already one provider behind the union, and a job saved on the new
+      // agent would have been dropped back to its default on the next read
+      // with nothing to say it had been.
+      if (!isProvider(row.provider)) continue;
       out[job.id] = {
         provider: row.provider,
         model: row.model,
@@ -527,57 +367,6 @@ export async function getJobModels(): Promise<JobModels> {
 
 export async function setJobModels(models: JobModels): Promise<void> {
   await setSetting(JOB_MODELS_KEY, JSON.stringify(models));
-}
-
-// ── Chats ────────────────────────────────────────────────────────────────────
-//
-// Rows here are written by Rust (`app/src-tauri/src/agent.rs`), not by this
-// module — the agent loop re-reads its own tool turns, so the history has to
-// be authoritative where the loop runs. These are the read side plus delete.
-
-export interface DbChat {
-  id: number;
-  title: string | null;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface DbChatMessage {
-  id: number;
-  chat_id: number;
-  role: "user" | "assistant" | "tool";
-  content: string | null;
-  tool_calls: string | null;
-  tool_call_id: string | null;
-  /** JSON array of {subject_id, relative_path, filename, page_no}. */
-  citations: string | null;
-  model: string | null;
-  created_at: string;
-}
-
-export async function getChats(limit = 50): Promise<DbChat[]> {
-  const db = await getDb();
-  return db.select<DbChat[]>(
-    `SELECT id, title, created_at, updated_at FROM chats
-     ORDER BY updated_at DESC LIMIT $1`,
-    [limit],
-  );
-}
-
-/** Display history: the tool plumbing turns are for the model, not the reader. */
-export async function getChatMessages(chatId: number): Promise<DbChatMessage[]> {
-  const db = await getDb();
-  return db.select<DbChatMessage[]>(
-    `SELECT * FROM chat_messages
-     WHERE chat_id = $1 AND role IN ('user', 'assistant') AND tool_calls IS NULL
-     ORDER BY id ASC`,
-    [chatId],
-  );
-}
-
-export async function deleteChat(id: number): Promise<void> {
-  const db = await getDb();
-  await db.execute(`DELETE FROM chats WHERE id = $1`, [id]);
 }
 
 // ── Sync runs ────────────────────────────────────────────────────────────────
@@ -789,10 +578,15 @@ export async function markFileContentChanged(
   );
 }
 
-/** Forget a file's parse/embed state after a re-scrape changed its bytes.
- *  The Rust side purges the on-disk artifacts (`.md`, `.pages.json`,
- *  `.emb.json`); this clears the DB's view — stored pages and both status
- *  columns — so the pipeline re-runs and search never serves stale text. */
+/** Forget a file's parse *and embed* state after a re-scrape changed its bytes.
+ *  The Rust side purges the on-disk artifacts; this clears the DB's view so
+ *  both stages re-run and nothing serves stale text or ranks a vector of a
+ *  page that no longer exists.
+ *
+ *  Clearing `embed_status` / `embedded_at` is load-bearing again now that
+ *  `retrieval::ingest` writes them: new bytes mean new pages, and a page
+ *  vector that outlived its page is a hit that deep-links into a document
+ *  which does not say that any more. */
 export async function resetFilePipeline(
   subjectId: number,
   relativePath: string,
@@ -811,15 +605,20 @@ export async function resetFilePipeline(
   );
 }
 
-/** Remove an upload's row and indexed pages. Explicit page deletion also works
- *  on SQLite connections without foreign-key enforcement. */
+/** Drop one file's row along with its indexed pages — what keeps search from
+ *  ranking a page of a file that is no longer on disk.
+ *
+ *  `pages.file_id` is declared `ON DELETE CASCADE`, but the delete is written
+ *  out anyway: SQLite enforces foreign keys only when `PRAGMA foreign_keys=ON`
+ *  is set per connection, and nothing here sets it — so the constraint is
+ *  documentation, not a guarantee, and orphaned embeddings would outlive the
+ *  file silently.
+ *
+ *  Only uploads are ever deleted this way; a scraped file's row belongs to the
+ *  sync that wrote it. */
 export async function deleteFileRow(id: number): Promise<void> {
   const db = await getDb();
-  await db.execute(
-    `DELETE FROM pages WHERE file_id IN
-       (SELECT id FROM files WHERE id = $1 AND category = 'upload')`,
-    [id],
-  );
+  await db.execute(`DELETE FROM pages WHERE file_id IN (SELECT id FROM files WHERE id = $1 AND category = 'upload')`, [id]);
   await db.execute(`DELETE FROM files WHERE id = $1 AND category = 'upload'`, [id]);
 }
 
@@ -841,17 +640,58 @@ export interface MentionFile {
 }
 
 /**
+ * The `@` query's words as AND-ed `LIKE` predicates over `f.filename`, ready
+ * to drop into a `WHERE`, plus the parameters to bind from `$from` on.
+ *
+ * Shared by the two functions below, and shared deliberately: the menu and
+ * the "N matching files have no markdown" line underneath it have to agree
+ * about what *matching* means, or the line contradicts the list it is there
+ * to explain.
+ *
+ * Every word must appear in the filename, in any order — which is what makes
+ * a query with spaces in it worth allowing, since "week 3 workshop" is how a
+ * student names `week-03-workshop-solutions.pdf`. Splitting and escaping are
+ * the palette's own `terms` (below), so `%`, `_` and `\` in a filename are
+ * literal here too. An empty query matches everything and leaves the ordering
+ * to decide — and `prefix` is then `%`, which ranks every row alike for the
+ * same reason.
+ *
+ * `from` is where the caller's own parameters leave off, and every caller has
+ * to keep its numbering climbing in the order the *text* of the statement
+ * mentions it: SQLite treats `$1` as a parameter *named* `$1` and hands out
+ * indices by first appearance, so a placeholder used out of order silently
+ * binds a neighbour's value.
+ */
+function mentionMatch(
+  query: string,
+  from: number,
+): { where: string; params: string[]; prefix: string } {
+  const words = terms(query);
+  return {
+    where: words.length
+      ? words.map((_, i) => `f.filename LIKE $${from + i} ESCAPE '\\'`).join(" AND ")
+      : "1",
+    params: words.map((w) => `%${w}%`),
+    prefix: `${words[0] ?? ""}%`,
+  };
+}
+
+/**
  * Candidates for an `@` mention, narrowed to the chat's subject when it has
  * one.
  *
  * Only files the agent can actually read are offered: `.md` is on disk as
- * written, but a PDF or slide deck has text only once the sidecar has parsed
- * it — the same `('fast', 'quality')` predicate retrieval uses. An unparsed
- * deck in the list would be an `oculus read` that comes back empty after the
- * student picked it, which is worse than not offering it.
+ * written, but a PDF or slide deck has text only once it has been parsed, and
+ * `parse_status = 'quality'` is the one status that says so. (The string is
+ * the finished-parse marker, not a tier — there is only one parse; see
+ * `app/src/stores/parseStore.ts`.) An unparsed deck in the list would be an
+ * `oculus read` that comes back empty after the student picked it, which is
+ * worse than not offering it.
  *
- * Ordered by prefix match, then by what they opened recently: with no query
- * typed the list is the handful of files they were just working in.
+ * Ordered by a prefix match on the **first** word, then by what they opened
+ * recently: with no query typed the list is the handful of files they were
+ * just working in, and with one typed a real title beats an incidental
+ * substring.
  */
 export async function searchMentionFiles(
   subjectId: number | null,
@@ -859,21 +699,53 @@ export async function searchMentionFiles(
   limit = 8,
 ): Promise<MentionFile[]> {
   const db = await getDb();
-  const esc = query.replace(/[%_\\]/g, (c) => `\\${c}`);
+  const { where, params, prefix } = mentionMatch(query, 2);
   return db.select<MentionFile[]>(
     `SELECT f.id, f.subject_id, s.code AS subject_code, f.filename,
             f.relative_path, f.category
      FROM files f
      JOIN subjects s ON s.id = f.subject_id
-     WHERE (f.file_type = 'md' OR f.parse_status IN ('fast', 'quality'))
+     WHERE (f.file_type = 'md' OR f.parse_status = 'quality')
        AND ($1 IS NULL OR f.subject_id = $1)
-       AND ($2 = '' OR f.filename LIKE $3 ESCAPE '\\')
-     ORDER BY (f.filename LIKE $4 ESCAPE '\\') DESC,
+       AND (${where})
+     ORDER BY (f.filename LIKE $${params.length + 2} ESCAPE '\\') DESC,
               f.last_accessed_at DESC,
               f.filename ASC
-     LIMIT $5`,
-    [subjectId, query, `%${esc}%`, `${esc}%`, limit],
+     LIMIT $${params.length + 3}`,
+    [subjectId, ...params, prefix, limit],
   );
+}
+
+/**
+ * How many files the `@` query *would* have matched if they had markdown.
+ *
+ * The filter above is a capability, not a preference, so an unparsed deck is
+ * simply absent — and absence in a type-ahead is indistinguishable from a
+ * typo. This is what lets the menu say "two more match, they have no markdown
+ * yet" instead of nothing at all — which only holds if it counts what the
+ * menu searched, so it matches through `mentionMatch` too: the same words
+ * against the same column, the search above with its capability filter
+ * inverted rather than a second idea of what the student meant. Only
+ * PDF-backed types are counted (the list `useQualitySweep` parses): a zip or
+ * an image is not waiting on a parse and never will be, so counting it would
+ * promise markdown that is not coming.
+ */
+export async function countUnparsedMentionMatches(
+  subjectId: number | null,
+  query: string,
+): Promise<number> {
+  const db = await getDb();
+  const { where, params } = mentionMatch(query, 2);
+  const rows = await db.select<{ n: number }[]>(
+    `SELECT COUNT(*) AS n
+     FROM files f
+     WHERE lower(f.file_type) IN ('pdf', 'pptx', 'docx', 'ppt', 'doc')
+       AND (f.parse_status IS NULL OR f.parse_status != 'quality')
+       AND ($1 IS NULL OR f.subject_id = $1)
+       AND (${where})`,
+    [subjectId, ...params],
+  );
+  return rows[0]?.n ?? 0;
 }
 
 /**
@@ -942,7 +814,7 @@ function terms(query: string): string[] {
  * prepended so the first word counts as one — which floats a real title match
  * above an incidental substring.
  */
-function matchSql(
+export function matchSql(
   haystack: string,
   query: string,
 ): { where: string; rank: string; params: string[] } {
@@ -973,8 +845,8 @@ export interface LibraryLectureHit {
  * Files matching a palette query, best first.
  *
  * Unlike the chat's `@` menu this offers *every* file, parsed or not: the
- * palette opens a file for a person to read, and a PDF still awaiting the
- * sidecar renders perfectly well. Ties break towards this term's coursework and
+ * palette opens a file for a person to read, and an unparsed PDF renders
+ * perfectly well. Ties break towards this term's coursework and
  * then towards what was opened most recently, so an empty query is the handful
  * of files you were last in.
  */
@@ -1018,6 +890,133 @@ export async function searchLibraryLectures(
   );
 }
 
+/**
+ * One file whose *pages* matched, with the prose that matched under it.
+ *
+ * Enough of a file to open it and to draw a row, plus the page the hit was on
+ * and the snippet FTS5 cut around it.
+ */
+export interface PageTextHit {
+  file_id: number;
+  subject_id: number;
+  subject_code: string;
+  relative_path: string;
+  filename: string;
+  category: string | null;
+  page_no: number;
+  /** The matched line, with each hit fenced by {@link SNIP_OPEN} /
+   *  {@link SNIP_CLOSE}. Parsed by `snippetParts`, never rendered raw. */
+  snippet: string;
+}
+
+/** The fences `snippet()` wraps a hit in. Two control characters, because the
+ *  markdown they are being spliced into can contain any printable delimiter
+ *  you might otherwise reach for — `**`, `<mark>`, `[[`. */
+export const SNIP_OPEN = "\u0001";
+export const SNIP_CLOSE = "\u0002";
+
+/** Below this a prefix term matches most of the library, and the scan is both
+ *  slow and useless. Two letters is where "ml" still works. */
+const MIN_TEXT_QUERY = 2;
+
+/** A term FTS5 can tokenise — one with a letter or a digit in it. `"--"` is
+ *  not one, and a phrase with no tokens in it is a syntax error, not an empty
+ *  result. */
+function ftsTerms(query: string): string[] {
+  return query
+    .trim()
+    .split(/\s+/)
+    .filter((w) => /[\p{L}\p{N}]/u.test(w))
+    .slice(0, MAX_TERMS);
+}
+
+/**
+ * The FTS5 MATCH expression for what was typed: every word required, each one
+ * a prefix so the last one answers while it is still being typed.
+ *
+ * Each term is wrapped in double quotes — as an FTS5 *string*, not as a phrase
+ * the user asked for — because unquoted input is a query language: `AND`, `OR`,
+ * `NOT`, `NEAR`, `^`, `-`, `(` and `:` all mean something in it, and a person
+ * typing `not-for-profit` into a search box means none of them.
+ */
+function ftsMatch(query: string): string | null {
+  const words = ftsTerms(query);
+  if (words.length === 0) return null;
+  if (words.join("").length < MIN_TEXT_QUERY) return null;
+  return words.map((w) => `"${w.replace(/"/g, '""')}"*`).join(" ");
+}
+
+/**
+ * Files whose page text matches, best first — the lexical half of search.
+ *
+ * This is the only way to find a phrase *inside* a document. Title search
+ * cannot see into a deck, and the page-image index answers a question rather
+ * than a keystroke: it is a cloud round trip per query (see
+ * `docs/retrieval.md`), which is not something a field you are typing in can
+ * do. The index is `pages_fts`, built by migration 35 over `pages.markdown`
+ * and kept in step by triggers — so only *parsed* documents are in it, which
+ * is the honest limit of this search and not a bug to work around.
+ *
+ * One row per file, not per page: five pages of the same deck is one answer
+ * repeated, and the best page is the one worth going to. FTS5's auxiliary
+ * functions must run while the matching cursor is live, before aggregation
+ * or windowing. Materialise each page's score and snippet together, then
+ * rank those rows per file; tied pages consistently pick the earliest page.
+ *
+ * The join onto `pages` is load-bearing beyond the columns it fetches: an
+ * entry left behind by a cascade delete has no page to join to and drops out
+ * (see `retrieval::PAGES_FTS_SQL`).
+ */
+export async function searchPageText(
+  query: string,
+  limit = 5,
+): Promise<PageTextHit[]> {
+  const match = ftsMatch(query);
+  if (!match) return [];
+  const db = await getDb();
+  try {
+    return await db.select<PageTextHit[]>(
+      `WITH hits AS MATERIALIZED (
+       SELECT p.id             AS page_id,
+              p.file_id        AS file_id,
+              f.subject_id     AS subject_id,
+              s.code           AS subject_code,
+              f.relative_path  AS relative_path,
+              f.filename       AS filename,
+              f.category       AS category,
+              s.is_current     AS is_current,
+              p.page_no        AS page_no,
+              snippet(pages_fts, 0, $1, $2, '…', 14) AS snippet,
+              bm25(pages_fts)   AS score
+         FROM pages_fts
+         JOIN pages p    ON p.id = pages_fts.rowid
+         JOIN files f    ON f.id = p.file_id
+         JOIN subjects s ON s.id = f.subject_id
+        WHERE pages_fts MATCH $3
+       ), ranked AS (
+         SELECT hits.*,
+                ROW_NUMBER() OVER (
+                  PARTITION BY file_id ORDER BY score ASC, page_no ASC, page_id ASC
+                ) AS file_rank
+           FROM hits
+       )
+       SELECT file_id, subject_id, subject_code, relative_path,
+              filename, category, page_no, snippet
+         FROM ranked
+        WHERE file_rank = 1
+        ORDER BY score ASC, is_current DESC, file_id ASC
+        LIMIT $4`,
+      [SNIP_OPEN, SNIP_CLOSE, match, limit],
+    );
+  } catch (e) {
+    // A malformed MATCH is the one error worth swallowing: it is the user
+    // still typing, not a broken index, and the rest of the search has
+    // answers for them either way.
+    console.warn("[oculus] page text search", e);
+    return [];
+  }
+}
+
 /** Every PDF on record, with where it got to — seeds the Sync page's pipeline
  *  table so files still awaiting a parse or embed show up as backlog. */
 export interface PdfPipelineRow {
@@ -1041,16 +1040,82 @@ export async function getPdfPipelineRows(): Promise<PdfPipelineRow[]> {
   );
 }
 
-/** Update a PDF's parse status. status: 'fast' | 'quality' | 'error' | 'queued' | 'running' */
+/** Update a PDF's parse status. status: 'queued' | 'running' | 'quality' |
+ *  'error'. `'quality'` is the one terminal success — the name outlived the
+ *  tier it was named after, and the library's existing rows all speak it. */
 export async function setParseStatus(
   subjectId: number,
   relativePath: string,
   status: string,
 ): Promise<void> {
   const db = await getDb();
-  const setParsedAt = status === "quality" || status === "fast";
+  const setParsedAt = status === "quality";
   await db.execute(
     `UPDATE files SET parse_status = $1${setParsedAt ? ", parsed_at = datetime('now')" : ""}
+     WHERE subject_id = $2 AND relative_path = $3`,
+    [status, subjectId, relativePath],
+  );
+}
+
+/**
+ * How much of each PDF is embedded **in the space passed in**, keyed by
+ * relative path — the seed for the pipeline table's third stage.
+ *
+ * Coverage, not `files.embed_status`, and the difference is the same one
+ * `getUnembeddedPdfs` is built on. `embed_status` is a sticky flag with no
+ * memory of which model wrote the vectors, so after an engine change it says
+ * `'done'` over a library where nothing is searchable. Counting current-space
+ * page vectors against the file's page rows makes the answer follow the space,
+ * and makes partial coverage — a document a rate limit stopped halfway —
+ * read as unfinished rather than silently permanent.
+ *
+ * `pages_total` is the file's page rows, which the parse writes. A file with
+ * none has not been parsed yet and cannot be embedded, so it is not covered
+ * by definition.
+ */
+export interface EmbedCoverageRow {
+  relative_path: string;
+  pages_total: number;
+  pages_current: number;
+}
+
+export async function getEmbedCoverage(
+  model: string | null,
+  dim: number | null,
+): Promise<EmbedCoverageRow[]> {
+  if (!model || dim == null) return [];
+  const db = await getDb();
+  return db.select<EmbedCoverageRow[]>(
+    `SELECT f.relative_path,
+            (SELECT COUNT(*) FROM pages p WHERE p.file_id = f.id) AS pages_total,
+            (SELECT COUNT(*) FROM pages p
+              WHERE p.file_id = f.id AND p.embedding IS NOT NULL
+                AND p.embed_model = $1 AND p.embed_dim = $2) AS pages_current
+     FROM files f
+     WHERE lower(f.file_type) IN ('pdf', 'pptx', 'docx', 'ppt', 'doc')`,
+    [model, dim],
+  );
+}
+
+/**
+ * Update a PDF's embed status. status: 'queued' | 'running' | 'done' | 'error'.
+ *
+ * Written for the *failure*, mostly. A file that embedded is told by its page
+ * vectors — which is what `getEmbedCoverage` reads and what the backlog query
+ * counts — but a file that failed leaves no trace anywhere else, and a
+ * pipeline row that forgot its failure on restart would silently become a row
+ * that is merely waiting. Rust writes `'done'` here too, on its own, when the
+ * ingest commits.
+ */
+export async function setEmbedStatus(
+  subjectId: number,
+  relativePath: string,
+  status: string,
+): Promise<void> {
+  const db = await getDb();
+  const setEmbeddedAt = status === "done";
+  await db.execute(
+    `UPDATE files SET embed_status = $1${setEmbeddedAt ? ", embedded_at = datetime('now')" : ""}
      WHERE subject_id = $2 AND relative_path = $3`,
     [status, subjectId, relativePath],
   );
@@ -1118,6 +1183,12 @@ export interface Lecture {
   /** Why the last run failed; cleared on success. A status column cannot
    *  carry a message, and the player has to be able to say what went wrong. */
   chapter_error: string | null;
+  /** The reading-copy job's state, the same four values `chapter_status`
+   *  takes. The two jobs are independent: a lecture can have one, both or
+   *  neither. */
+  reading_status: string | null;
+  reading_written_at: string | null;
+  reading_error: string | null;
 }
 
 export interface LectureData {
@@ -1270,6 +1341,51 @@ export async function getChapterStatus(
   const rows = await db.select<
     { chapter_status: string | null; chapter_error: string | null }[]
   >(`SELECT chapter_status, chapter_error FROM lectures WHERE id = $1`, [lectureId]);
+  return rows[0] ?? null;
+}
+
+// ── Lecture reading copy ──────────────────────────────────────────────────────
+
+/**
+ * One row of `lecture_reading` (migration 34), written by the reading-copy job
+ * in `app/src-tauri/src/reading.rs`.
+ *
+ * The lecture as text you can read: one sentence per line, pinned to the
+ * second it was said, with the spoken maths set as `$…$`. A line runs until
+ * the next one starts — no end column, for the reason `Chapter` has none —
+ * and a two-hour lecture has ~600 of them, which is why the Read tab renders
+ * them through the transcript's virtualised `FollowList`.
+ *
+ * `para` is derived in Rust after validation, never asked of the model: 1 for
+ * a window's first line and for the first line at or after a slide change,
+ * which is where the panel breaks a paragraph.
+ */
+export interface ReadingLine {
+  lecture_id: string;
+  idx: number;
+  start_seconds: number;
+  para: number;
+  text: string;
+}
+
+export async function getReading(lectureId: string): Promise<ReadingLine[]> {
+  const db = await getDb();
+  return db.select<ReadingLine[]>(
+    `SELECT * FROM lecture_reading WHERE lecture_id = $1 ORDER BY idx ASC`,
+    [lectureId],
+  );
+}
+
+/** The reading-copy job's state, read on its own for the reason
+ *  `getChapterStatus` is: the player's `lecture` prop is a snapshot that
+ *  predates the run. */
+export async function getReadingStatus(
+  lectureId: string,
+): Promise<{ reading_status: string | null; reading_error: string | null } | null> {
+  const db = await getDb();
+  const rows = await db.select<
+    { reading_status: string | null; reading_error: string | null }[]
+  >(`SELECT reading_status, reading_error FROM lectures WHERE id = $1`, [lectureId]);
   return rows[0] ?? null;
 }
 
@@ -1468,6 +1584,85 @@ export async function getLocalEvents(): Promise<DbLocalEvent[]> {
        FROM local_events le
        LEFT JOIN subjects s ON s.id = le.subject_id
       ORDER BY le.start_at ASC`,
+  );
+}
+
+/**
+ * A local event's fields, as the editor holds them.
+ *
+ * `subjectId` is `null` for a row that belongs to no subject — the "Personal"
+ * key the calendar files those under. Dates are full ISO 8601 instants, the
+ * shape `DateTimeField` commits, so a row written here and one an automation
+ * left behind read identically.
+ */
+export interface LocalEventInput {
+  subjectId: number | null;
+  /** `note`, `class` or `due` — the three layers a local row can join. */
+  kind: string;
+  title: string;
+  startAt: string;
+  endAt: string | null;
+  allDay: boolean;
+  notes: string | null;
+}
+
+/**
+ * Write a local event and return its id.
+ *
+ * `source` is always `manual`: the only other value, `automation`, belongs to
+ * rows the removed automations feature left behind, and nothing writes it any
+ * more. The id comes from `execute()`'s own result rather than a follow-up
+ * `SELECT last_insert_rowid()`, which runs on whichever pooled connection is
+ * free and can hand back another statement's id.
+ */
+export async function createLocalEvent(input: LocalEventInput): Promise<number> {
+  const db = await getDb();
+  const res = await db.execute(
+    `INSERT INTO local_events
+       (subject_id, kind, title, start_at, end_at, all_day, notes, source)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'manual')`,
+    [
+      input.subjectId,
+      input.kind,
+      input.title,
+      input.startAt,
+      input.endAt,
+      input.allDay ? 1 : 0,
+      input.notes,
+    ],
+  );
+  if (res.lastInsertId == null) throw new Error("local event insert returned no id");
+  return res.lastInsertId;
+}
+
+/**
+ * Rewrite a local event in place.
+ *
+ * Every editable column is replaced at once — the editor holds the whole row
+ * anyway, and a partial update would mean building a column list at runtime for
+ * no gain. `source` is deliberately not among them: editing a row an automation
+ * once left behind should not relabel it as something the user typed.
+ */
+export async function updateLocalEvent(
+  id: number,
+  input: LocalEventInput,
+): Promise<void> {
+  const db = await getDb();
+  await db.execute(
+    `UPDATE local_events
+        SET subject_id = $1, kind = $2, title = $3, start_at = $4,
+            end_at = $5, all_day = $6, notes = $7
+      WHERE id = $8`,
+    [
+      input.subjectId,
+      input.kind,
+      input.title,
+      input.startAt,
+      input.endAt,
+      input.allDay ? 1 : 0,
+      input.notes,
+      id,
+    ],
   );
 }
 

@@ -7,6 +7,13 @@
 //! elected a single summer enrolment over the semester being studied, and
 //! every real subject was stamped as past.
 //!
+//! Not every term is named after a semester either. A short intensive comes
+//! back as the month it runs in — `"2026 June"` for `THTR30042_2026_JUN_STH_2`
+//! — so the months map onto the term they fall inside: January/February are
+//! Summer, June/July are Winter. Left unranked they sorted after every real
+//! term, and the same `.max()` elected a one-off intensive over the semester
+//! being studied.
+//!
 //! The year prefix compares fine either way; only the term within a year needs
 //! a rank. Mirrored in `app/src/lib/terms.ts`, which the frontend uses to
 //! derive the same answer at read time — both sides have to agree, because a
@@ -30,6 +37,10 @@ pub fn term_rank(name: &str) -> u8 {
         2
     } else if semester("2") || has(&["sm2"]) {
         3
+    } else if has(&["january", "february"]) {
+        0
+    } else if has(&["june", "july"]) {
+        2
     } else {
         9
     }
@@ -94,6 +105,18 @@ mod tests {
         ];
         let latest = terms.iter().max_by_key(|t| term_key(t)).unwrap();
         assert_eq!(*latest, "2026 Semester 2");
+    }
+
+    #[test]
+    fn a_month_named_intensive_ranks_as_the_term_it_runs_in() {
+        // The June intensive is a winter term, not an unknown one — otherwise
+        // it outranks Semester 2 and steals "current" from the real enrolment.
+        assert_eq!(term_rank("2026 June"), term_rank("2026 Winter Term"));
+        assert!(term_key("2026 June") < term_key("2026 Semester 2"));
+        assert!(term_key("2026 June") > term_key("2026 Semester 1"));
+        assert_eq!(term_rank("2026 January"), term_rank("2026 Summer Term"));
+        // A semester wins its own name back from the month in the brackets.
+        assert_eq!(term_rank("2026 Semester 2 (July start)"), 3);
     }
 
     #[test]

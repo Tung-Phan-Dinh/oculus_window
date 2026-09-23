@@ -8,14 +8,116 @@
 //! Schema ownership stays with the plugin's migrations. If the database does
 //! not exist yet, we do not invent one; the caller reports that and keeps
 //! scraping to disk.
-//! `retrieval::pool` resolves the database file before SQLite opens it, so a
+//! `store::pool` resolves the database file before SQLite opens it, so a
 //! CLI with a physical Windows AppData path shares the app's WAL and locks.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
+use tauri::{AppHandle, Manager};
 
 use crate::sync::Course;
+
+// ── The connection pool ──────────────────────────────────────────────────────
+//
+// These three lived in `retrieval.rs` while retrieval was the only thing in
+// Rust that touched the database on its own. It is not any more — the parse
+// path writes page records too — so helpers every module needs do not belong
+// inside one of them. This is the DB-access module and the one they all
+// already depend on; the helpers belong here and every caller says `store::`.
+
+/// Our own pool over the file tauri-plugin-sql already manages. WAL means a
+/// second reader is harmless, and our writes are occasional (once per file
+/// parsed), so a busy timeout is enough to stay out of the plugin's way.
+pub async fn pool(path: &Path) -> Result<SqlitePool, String> {
+    let path = crate::database::resolve_path(path)?;
+    let opts = SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(false)
+        .busy_timeout(Duration::from_secs(15));
+    SqlitePoolOptions::new()
+        .max_connections(2)
+        .connect_with(opts)
+        .await
+        .map_err(|e| format!("open {}: {e}", path.display()))
+}
+
+/// Where the app's database is, asked of Tauri rather than recomputed. The
+/// answer is the same one `paths::db_path(paths::data_dir())` gives; this is
+/// for the command layer, which already has a handle.
+pub fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    Ok(dir.join("oculus.db"))
+}
+
+/// Open the shared database the same way the CLI does — no AppHandle, so this
+/// works headless.
+pub async fn open_pool() -> Result<SqlitePool, String> {
+    let path = crate::paths::db_path(&crate::paths::data_dir());
+    if !path.exists() {
+        return Err(format!("no database at {}", path.display()));
+    }
+    pool(&path).await
+}
+
+/// Read one `settings` row from a **synchronous** caller, from any context.
+///
+/// Both seams need to know which backend is selected before they have an async
+/// frame to await in: the parse queue and the CLI are plain threads, and
+/// `parse_config` / `embed_config` are called from inside clients that are not
+/// async at all.
+///
+/// The obvious spelling for that — `tauri::async_runtime::block_on` — is a
+/// **trap**, and it cost a real bug. It is correct on a plain thread and on a
+/// `spawn_blocking` worker, and it *panics* on a runtime worker thread:
+/// "Cannot start a runtime from within a runtime". An `async` Tauri command
+/// runs on exactly such a thread, so `embed_settings` aborted mid-task, its
+/// promise never settled, and Settings → Library sat on its loading state
+/// forever — every field a dash, no error to show, because an aborted task
+/// rejects nothing. The indexing and search paths were fine the whole time,
+/// which is what made it look like a data problem instead of a crash.
+///
+/// So this never touches the caller's runtime. The read happens on a thread of
+/// its own with a current-thread runtime and the caller joins it: one `SELECT`
+/// a few times per run makes the spawn free, and **one code path** means the
+/// behaviour cannot depend on who is calling. Never reintroduce a `block_on`
+/// here, and never make its safety a fact about the call site.
+///
+/// `None` covers every uninteresting case — no database yet, no such row,
+/// a read that failed — because every caller's answer to all three is the same
+/// default.
+pub fn setting_blocking(key: &str) -> Option<String> {
+    let database = crate::paths::db_path(&crate::paths::data_dir());
+    if !database.is_file() {
+        return None;
+    }
+    let key = key.to_string();
+
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().ok()?;
+        runtime.block_on(async move {
+            use sqlx::Connection;
+            let options = SqliteConnectOptions::new()
+                .filename(&database)
+                .create_if_missing(false)
+                .busy_timeout(Duration::from_secs(15));
+            let mut connection = sqlx::SqliteConnection::connect_with(&options).await.ok()?;
+            let row = sqlx::query("SELECT value FROM settings WHERE key = ?1")
+                .bind(&key)
+                .fetch_optional(&mut connection)
+                .await
+                .ok()
+                .flatten();
+            connection.close().await.ok();
+            row?.try_get::<String, _>("value").ok()
+        })
+    })
+    .join()
+    .ok()
+    .flatten()
+}
 
 pub async fn open(data_dir: &Path) -> Result<SqlitePool, String> {
     let path = crate::paths::db_path(data_dir);
@@ -25,7 +127,7 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool, String> {
             path.display()
         ));
     }
-    crate::retrieval::pool(&path).await
+    pool(&path).await
 }
 
 // ── Subjects ─────────────────────────────────────────────────────────────────
@@ -164,6 +266,61 @@ pub async fn file_id(
         .map_err(|e| e.to_string())
 }
 
+/// Write one file's page records.
+///
+/// This used to happen on the *embed* path only (`retrieval::ingest`), which
+/// meant `pages.markdown` — the table `oculus grep` reads — was a side effect
+/// of building the vector index. With embeddings going away, finishing a parse
+/// has to write its own page records or the tool the user actually reaches for
+/// would quietly go blank.
+///
+/// The conflict clause is deliberately **not** a `COALESCE`: an empty incoming
+/// markdown must leave good text alone. A page that yields nothing (a slide
+/// that is one full-bleed image) normalises to `""` in `ParseOutput`, and a
+/// re-parse that produced fewer pages than the last one would otherwise wipe
+/// the text the last one found.
+///
+/// Nothing here touches `embedding` / `embed_model` / `embed_dim` /
+/// `embedded_at`. Those stay the embedder's until it stops writing them, and
+/// the columns stay in the schema either way.
+pub async fn upsert_pages(
+    pool: &SqlitePool,
+    file_id: i64,
+    pages: &[crate::parse::ParsePage],
+) -> Result<usize, String> {
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    let mut with_text = 0usize;
+    for page in pages {
+        if !page.markdown.is_empty() {
+            with_text += 1;
+        }
+        sqlx::query(
+            r#"INSERT INTO pages (file_id, page_no, markdown)
+               VALUES (?1, ?2, ?3)
+               ON CONFLICT(file_id, page_no) DO UPDATE SET
+                 markdown = CASE WHEN excluded.markdown != '' THEN excluded.markdown ELSE pages.markdown END"#,
+        )
+        .bind(file_id)
+        .bind(i64::from(page.page_no))
+        .bind(&page.markdown)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("upsert page {}: {e}", page.page_no))?;
+    }
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(with_text)
+}
+
+/// How many page rows this file already has. Cheap enough to ask before
+/// deciding whether an already-parsed file needs its record folding in.
+pub async fn page_count(pool: &SqlitePool, file_id: i64) -> Result<i64, String> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM pages WHERE file_id = ?1")
+        .bind(file_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Every PDF-backed file on record (PDFs and Office documents with a derived
 /// sibling PDF), optionally narrowed to a set of subjects.
 pub async fn pdf_files(
@@ -187,9 +344,23 @@ pub async fn pdf_files(
         .collect())
 }
 
-/// Derive parse status from what the sidecar left on disk. Without the app's
+/// Derive parse status from what the parser left on disk. Without the app's
 /// event listener running, this is how a CLI run's parse results reach the
 /// database.
+///
+/// `parse::parse_mode` answers a binary question now — `Some("quality")` or
+/// `None` — where it used to have a third value. `None` **clears** the row
+/// rather than skipping it, and that is the whole point of the sweep in the
+/// other direction: `files.parse_status` also holds the transient states the
+/// app writes from `parse-status` events (`queued`, `running`, `error`), and a
+/// run that is killed mid-parse leaves one of those behind with nothing left
+/// alive to finish it. The artifacts on disk are the only durable truth, so a
+/// row claiming anything the disk does not back is stale by definition. It is
+/// the same reconciliation `reconcile_chapter_status` performs.
+///
+/// Nothing in the live library actually changes value today: 166 rows say
+/// `quality` and have the record to prove it, 540 are already NULL, and the
+/// `fast` the old three-value reader could invent never made it to disk.
 pub async fn reconcile_parse_status(pool: &SqlitePool, data_dir: &Path) -> Result<u64, String> {
     let rows = sqlx::query("SELECT relative_path FROM files")
         .fetch_all(pool)
@@ -202,18 +373,28 @@ pub async fn reconcile_parse_status(pool: &SqlitePool, data_dir: &Path) -> Resul
         let Some(pdf_rel) = crate::paths::doc_pdf_rel(&rel) else {
             continue;
         };
-        let Some(status) = crate::paths::parse_mode(&data_dir.join(&pdf_rel)) else {
-            continue;
-        };
 
-        let res = sqlx::query(
-            "UPDATE files SET parse_status = ?1, parsed_at = datetime('now')
-             WHERE relative_path = ?2 AND (parse_status IS NULL OR parse_status != ?1)",
-        )
-        .bind(status)
-        .bind(&rel)
-        .execute(pool)
-        .await
+        let res = match crate::parse::parse_mode(&data_dir.join(&pdf_rel)) {
+            Some(status) => {
+                sqlx::query(
+                    "UPDATE files SET parse_status = ?1, parsed_at = datetime('now')
+                     WHERE relative_path = ?2 AND (parse_status IS NULL OR parse_status != ?1)",
+                )
+                .bind(status)
+                .bind(&rel)
+                .execute(pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    "UPDATE files SET parse_status = NULL, parsed_at = NULL
+                     WHERE relative_path = ?1 AND parse_status IS NOT NULL",
+                )
+                .bind(&rel)
+                .execute(pool)
+                .await
+            }
+        }
         .map_err(|e| e.to_string())?;
         updated += res.rows_affected();
     }
@@ -236,13 +417,13 @@ pub async fn reconcile_chapter_status(pool: &SqlitePool) -> Result<u64, String> 
     .map_err(|e| e.to_string())
 }
 
-/// Recap runs that were killed mid-job. The windows already written remain
+/// Reading-copy runs that were killed mid-job. The windows already written remain
 /// visible, but `running` cannot survive the process that owned it or the
 /// player would wait forever for progress that can no longer arrive.
-pub async fn reconcile_recap_status(pool: &SqlitePool) -> Result<u64, String> {
+pub async fn reconcile_reading_status(pool: &SqlitePool) -> Result<u64, String> {
     sqlx::query(
-        "UPDATE lectures SET recap_status = NULL, recap_error = NULL
-          WHERE recap_status = 'running'",
+        "UPDATE lectures SET reading_status = NULL, reading_error = NULL
+          WHERE reading_status = 'running'",
     )
     .execute(pool)
     .await
@@ -474,19 +655,19 @@ pub async fn chapters(
         .collect())
 }
 
-/// Atomically claim a recap run and clear the previous derived set.
+/// Atomically claim a reading-copy run and clear the previous derived set.
 ///
 /// The conditional update is the one shared gate for the app and CLI. Two
 /// callers may race to this transaction, but only the first can change a row
 /// that is not already `running`; the loser spends no model turn. Clearing the
-/// old notes is in the same transaction, so a failed delete cannot strand the
+/// old lines is in the same transaction, so a failed delete cannot strand the
 /// lecture in `running`.
-pub async fn claim_recap(pool: &SqlitePool, lecture_id: &str) -> Result<bool, String> {
+pub async fn claim_reading(pool: &SqlitePool, lecture_id: &str) -> Result<bool, String> {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     let claimed = sqlx::query(
         "UPDATE lectures
-            SET recap_status = 'running', recap_error = NULL, recapped_at = NULL
-          WHERE id = ?1 AND (recap_status IS NULL OR recap_status <> 'running')",
+            SET reading_status = 'running', reading_error = NULL, reading_written_at = NULL
+          WHERE id = ?1 AND (reading_status IS NULL OR reading_status <> 'running')",
     )
         .bind(lecture_id)
         .execute(&mut *tx)
@@ -498,7 +679,7 @@ pub async fn claim_recap(pool: &SqlitePool, lecture_id: &str) -> Result<bool, St
         tx.rollback().await.map_err(|e| e.to_string())?;
         return Ok(false);
     }
-    sqlx::query("DELETE FROM lecture_recap WHERE lecture_id = ?1")
+    sqlx::query("DELETE FROM lecture_reading WHERE lecture_id = ?1")
         .bind(lecture_id)
         .execute(&mut *tx)
         .await
@@ -507,12 +688,12 @@ pub async fn claim_recap(pool: &SqlitePool, lecture_id: &str) -> Result<bool, St
     Ok(true)
 }
 
-/// The recap job's status, terminal timestamp and failure message.
+/// The reading-copy job's status, terminal timestamp and failure message.
 ///
-/// `recapped_at` records the most recent terminal transition, including an
+/// `reading_written_at` records the most recent terminal transition, including an
 /// error after some windows were saved. Starting or reconciling a run clears
 /// it; every non-error transition clears the previous failure message.
-pub async fn set_recap_status(
+pub async fn set_reading_status(
     pool: &SqlitePool,
     lecture_id: &str,
     status: Option<&str>,
@@ -521,9 +702,9 @@ pub async fn set_recap_status(
     let terminal = matches!(status, Some("ready") | Some("error"));
     sqlx::query(
         "UPDATE lectures
-            SET recap_status = ?1,
-                recap_error  = ?2,
-                recapped_at   = CASE WHEN ?3 THEN datetime('now') ELSE NULL END
+            SET reading_status = ?1,
+                reading_error  = ?2,
+                reading_written_at   = CASE WHEN ?3 THEN datetime('now') ELSE NULL END
           WHERE id = ?4",
     )
     .bind(status)
@@ -536,36 +717,36 @@ pub async fn set_recap_status(
     Ok(())
 }
 
-/// Append one validated recap window atomically.
+/// Append one validated reading window atomically.
 ///
 /// Windows commit independently by design. `idx` continues from the rows
 /// already present, which keeps play order stable while allowing the panel to
 /// show completed windows during a long run. The caller marks the lecture
 /// `ready` only after every window has landed.
-pub async fn save_recap_window(
+pub async fn save_reading_window(
     pool: &SqlitePool,
     lecture_id: &str,
-    notes: &[crate::recap::RecapNote],
+    lines: &[crate::reading::ReadingLine],
 ) -> Result<(), String> {
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     let first_idx: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(idx) + 1, 0) FROM lecture_recap WHERE lecture_id = ?1",
+        "SELECT COALESCE(MAX(idx) + 1, 0) FROM lecture_reading WHERE lecture_id = ?1",
     )
     .bind(lecture_id)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| e.to_string())?;
 
-    for (offset, note) in notes.iter().enumerate() {
+    for (offset, line) in lines.iter().enumerate() {
         sqlx::query(
-            "INSERT INTO lecture_recap (lecture_id, idx, start_seconds, label, body)
+            "INSERT INTO lecture_reading (lecture_id, idx, start_seconds, para, text)
              VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .bind(lecture_id)
         .bind(first_idx + offset as i64)
-        .bind(i64::from(note.start_seconds))
-        .bind(&note.label)
-        .bind(&note.body)
+        .bind(i64::from(line.start_seconds))
+        .bind(i64::from(line.para))
+        .bind(&line.text)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
@@ -575,14 +756,14 @@ pub async fn save_recap_window(
     Ok(())
 }
 
-/// A lecture's recap notes in play order, including complete windows from a
+/// A lecture's reading copy in play order, including complete windows from a
 /// run that is still in progress or ended with an error.
-pub async fn recap(
+pub async fn reading(
     pool: &SqlitePool,
     lecture_id: &str,
-) -> Result<Vec<crate::recap::RecapNote>, String> {
+) -> Result<Vec<crate::reading::ReadingLine>, String> {
     let rows = sqlx::query(
-        "SELECT start_seconds, label, body FROM lecture_recap
+        "SELECT start_seconds, para, text FROM lecture_reading
           WHERE lecture_id = ?1 ORDER BY idx",
     )
     .bind(lecture_id)
@@ -591,10 +772,10 @@ pub async fn recap(
     .map_err(|e| e.to_string())?;
     Ok(rows
         .iter()
-        .map(|r| crate::recap::RecapNote {
+        .map(|r| crate::reading::ReadingLine {
             start_seconds: r.get::<i64, _>("start_seconds").max(0) as u32,
-            label: r.get("label"),
-            body: r.get("body"),
+            para: r.get::<i64, _>("para") != 0,
+            text: r.get("text"),
         })
         .collect())
 }
@@ -674,7 +855,7 @@ mod tests {
 
     use super::*;
 
-    async fn recap_pool() -> SqlitePool {
+    async fn reading_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -683,27 +864,27 @@ mod tests {
         sqlx::query(
             "CREATE TABLE lectures (
                 id TEXT PRIMARY KEY,
-                recap_status TEXT,
-                recapped_at TEXT,
-                recap_error TEXT
+                reading_status TEXT,
+                reading_written_at TEXT,
+                reading_error TEXT
              )",
         )
         .execute(&pool)
         .await
         .expect("lecture schema");
         sqlx::query(
-            "CREATE TABLE lecture_recap (
+            "CREATE TABLE lecture_reading (
                 lecture_id TEXT NOT NULL REFERENCES lectures(id) ON DELETE CASCADE,
                 idx INTEGER NOT NULL,
                 start_seconds INTEGER NOT NULL,
-                label TEXT NOT NULL,
-                body TEXT NOT NULL,
+                para INTEGER NOT NULL DEFAULT 0,
+                text TEXT NOT NULL,
                 PRIMARY KEY (lecture_id, idx)
              )",
         )
         .execute(&pool)
         .await
-        .expect("recap schema");
+        .expect("reading schema");
         sqlx::query("INSERT INTO lectures (id) VALUES ('lecture-1')")
             .execute(&pool)
             .await
@@ -712,58 +893,200 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recap_windows_append_in_play_order_and_claim_clears_for_a_fresh_run() {
-        let pool = recap_pool().await;
-        let first = vec![crate::recap::RecapNote {
+    async fn reading_windows_append_in_play_order_and_claim_clears_for_a_fresh_run() {
+        let pool = reading_pool().await;
+        let first = vec![crate::reading::ReadingLine {
             start_seconds: 0,
-            label: "Opening".into(),
-            body: "The lecture begins.".into(),
+            para: true,
+            text: "We begin with the definition.".into(),
         }];
         let second = vec![
-            crate::recap::RecapNote {
+            crate::reading::ReadingLine {
                 start_seconds: 40,
-                label: "Definition".into(),
-                body: "A definition appears.".into(),
+                para: true,
+                text: "A state is $a_0|0\\rangle + a_1|1\\rangle$.".into(),
             },
-            crate::recap::RecapNote {
+            crate::reading::ReadingLine {
                 start_seconds: 75,
-                label: String::new(),
-                body: "The example continues.".into(),
+                para: false,
+                text: "The example continues.".into(),
             },
         ];
 
-        save_recap_window(&pool, "lecture-1", &first).await.unwrap();
-        save_recap_window(&pool, "lecture-1", &second).await.unwrap();
-        let saved = recap(&pool, "lecture-1").await.unwrap();
+        save_reading_window(&pool, "lecture-1", &first).await.unwrap();
+        save_reading_window(&pool, "lecture-1", &second).await.unwrap();
+        let saved = reading(&pool, "lecture-1").await.unwrap();
         assert_eq!(
             saved.iter().map(|n| n.start_seconds).collect::<Vec<_>>(),
             vec![0, 40, 75]
         );
+        assert_eq!(
+            saved.iter().map(|n| n.para).collect::<Vec<_>>(),
+            vec![true, true, false],
+            "para round-trips through the integer column"
+        );
+        assert_eq!(saved[1].text, second[0].text);
 
-        assert!(claim_recap(&pool, "lecture-1").await.unwrap());
-        assert!(recap(&pool, "lecture-1").await.unwrap().is_empty());
-        assert!(!claim_recap(&pool, "lecture-1").await.unwrap());
+        assert!(claim_reading(&pool, "lecture-1").await.unwrap());
+        assert!(reading(&pool, "lecture-1").await.unwrap().is_empty());
+        assert!(!claim_reading(&pool, "lecture-1").await.unwrap());
     }
 
     #[tokio::test]
-    async fn recap_status_stamps_only_terminal_runs_and_reconciles_running() {
-        let pool = recap_pool().await;
-        set_recap_status(&pool, "lecture-1", Some("running"), None)
+    async fn reading_status_stamps_only_terminal_runs_and_reconciles_running() {
+        let pool = reading_pool().await;
+        set_reading_status(&pool, "lecture-1", Some("running"), None)
             .await
             .unwrap();
-        assert_eq!(reconcile_recap_status(&pool).await.unwrap(), 1);
+        assert_eq!(reconcile_reading_status(&pool).await.unwrap(), 1);
 
-        set_recap_status(&pool, "lecture-1", Some("error"), Some("bad window"))
+        set_reading_status(&pool, "lecture-1", Some("error"), Some("bad window"))
             .await
             .unwrap();
         let row = sqlx::query(
-            "SELECT recap_status, recapped_at, recap_error FROM lectures WHERE id = 'lecture-1'",
+            "SELECT reading_status, reading_written_at, reading_error FROM lectures WHERE id = 'lecture-1'",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(row.get::<String, _>("recap_status"), "error");
-        assert!(row.get::<Option<String>, _>("recapped_at").is_some());
-        assert_eq!(row.get::<String, _>("recap_error"), "bad window");
+        assert_eq!(row.get::<String, _>("reading_status"), "error");
+        assert!(row.get::<Option<String>, _>("reading_written_at").is_some());
+        assert_eq!(row.get::<String, _>("reading_error"), "bad window");
+    }
+
+    // ── Page records ─────────────────────────────────────────────────────────
+
+    async fn pages_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        // The shape migration 12 created, embedding columns included: the
+        // parse path must leave them alone, not drop them.
+        sqlx::query(
+            "CREATE TABLE pages (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id     INTEGER NOT NULL,
+                page_no     INTEGER NOT NULL,
+                markdown    TEXT    NOT NULL DEFAULT '',
+                embedding   BLOB,
+                embed_model TEXT,
+                embed_dim   INTEGER,
+                embedded_at TEXT,
+                UNIQUE(file_id, page_no)
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("pages schema");
+        pool
+    }
+
+    fn page(page_no: u32, markdown: &str) -> crate::parse::ParsePage {
+        crate::parse::ParsePage { page_no, markdown: markdown.to_string() }
+    }
+
+    #[tokio::test]
+    async fn a_reparse_never_blanks_markdown_it_already_had() {
+        let pool = pages_pool().await;
+
+        let with_text = upsert_pages(&pool, 7, &[page(1, "one"), page(2, "two"), page(3, "")])
+            .await
+            .expect("first parse");
+        assert_eq!(with_text, 2);
+
+        // Pretend the embedder has been over it. Re-parsing must not disturb
+        // the vector columns — they stay the embedder's until it stops
+        // writing them.
+        sqlx::query("UPDATE pages SET embedding = X'00', embed_model = 'qwen' WHERE page_no = 1")
+            .execute(&pool)
+            .await
+            .expect("fake embedding");
+
+        // A second parse that came back thinner: page 2 now empty, page 1
+        // rewritten. The empty one must leave the good text standing — this is
+        // why the conflict clause is a CASE and not a COALESCE.
+        upsert_pages(&pool, 7, &[page(1, "one, better"), page(2, "")])
+            .await
+            .expect("second parse");
+
+        let rows = sqlx::query("SELECT page_no, markdown, embed_model FROM pages ORDER BY page_no")
+            .fetch_all(&pool)
+            .await
+            .expect("read back");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].get::<String, _>("markdown"), "one, better");
+        assert_eq!(rows[1].get::<String, _>("markdown"), "two");
+        assert_eq!(rows[2].get::<String, _>("markdown"), "");
+        assert_eq!(rows[0].get::<Option<String>, _>("embed_model").as_deref(), Some("qwen"));
+    }
+
+    // ── Parse status reconciliation ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn reconcile_follows_the_disk_in_both_directions() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let data_dir = std::env::temp_dir().join(format!("oculus-reconcile-{stamp}"));
+        let course = data_dir.join("courses/SUBJ/files");
+        std::fs::create_dir_all(&course).expect("scratch library");
+
+        let parsed = course.join("done.pdf");
+        std::fs::write(&parsed, b"%PDF").unwrap();
+        std::fs::write(
+            crate::parse::pages_path(&parsed),
+            r#"{"mode":"quality","parser_version":2,"page_count":1,"pages":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(course.join("gone.pdf"), b"%PDF").unwrap();
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        sqlx::query(
+            "CREATE TABLE files (
+                relative_path TEXT PRIMARY KEY,
+                parse_status  TEXT,
+                parsed_at     TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .expect("files schema");
+        sqlx::query(
+            "INSERT INTO files (relative_path, parse_status) VALUES
+               ('courses/SUBJ/files/done.pdf', NULL),
+               -- Left behind by a run that was killed mid-parse: only a live
+               -- process could ever have cleared this.
+               ('courses/SUBJ/files/gone.pdf', 'running')",
+        )
+        .execute(&pool)
+        .await
+        .expect("rows");
+
+        let updated = reconcile_parse_status(&pool, &data_dir).await.expect("reconcile");
+        assert_eq!(updated, 2);
+
+        let status = |rel: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT parse_status FROM files WHERE relative_path = ?1",
+                )
+                .bind(rel)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(status("courses/SUBJ/files/done.pdf").await.as_deref(), Some("quality"));
+        assert_eq!(status("courses/SUBJ/files/gone.pdf").await, None);
+
+        std::fs::remove_dir_all(&data_dir).ok();
     }
 }

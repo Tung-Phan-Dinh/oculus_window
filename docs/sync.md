@@ -39,6 +39,9 @@ is reported by the existing conversion error path.
   chronologically — `"2026 Summer Term"` beats `"2026 Semester 2"` as a
   string while starting six months earlier — so `app/src-tauri/src/terms.rs`
   ranks the term within its year (summer, semester 1, winter, semester 2).
+  A term Canvas names after its month rather than a semester — `"2026 June"`
+  for a winter intensive — takes the rank of the term it falls inside, so it
+  cannot rank as unknown and outrank the semester being studied.
   Before that, one summer enrolment marked a whole year of real subjects as
   past, and a default CLI sync fetched the summer subject alone.
 - **Modules are the driver.** The engine walks each course's modules and
@@ -104,18 +107,18 @@ is reported by the existing conversion error path.
   only the first band carried the ID and name columns — the rest were bare
   grids of numbers, which is both a meaningless page image and the markdown a
   citation would hydrate from. `SinglePageSheets` keeps every row with its
-  headers; `MAX_RENDER_PIXELS` in `sidecar/embedder.py` is what stops the
-  resulting page being rendered at its full size.
+  headers; `dpi_for_page` in `app/src-tauri/src/embed/raster.rs` bounds
+  oversized page renders before they reach the embedding backend.
 - **An untyped upload is judged by its extension.** Canvas reports whatever
   content type the uploading browser claimed, so the same deck arrives typed
   on one course and `application/octet-stream` on another. A generic type
   falls back to the filename (`office_ext_of`), which is still an allowlist —
   only the extensions the converter handles, plus `.pdf`.
 - **Changed bytes invalidate the parse.** An `updated` write purges the
-  sidecar artifacts (`.md`, `.pages.json`, `.emb.json` and the page-image folder — see
+  parse/embed artifacts (`.md`, `.pages.json`, `.emb.json` and the page-image folder — see
   `paths::purge_parse_artifacts`), and the app clears the file's stored
   pages and parse/embed statuses, so the pipeline re-runs instead of the
-  sidecar's existence checks pinning stale markdown and vectors.
+  pipeline's artifact checks pinning stale markdown and vectors.
 - **Personal files live in a subject's `uploads/` folder.** `import_uploads`
   copies picked files into `courses/<code>/uploads/` and returns a result for
   each pick, so one failure does not discard the other imports. Office files
@@ -198,17 +201,45 @@ is reported by the existing conversion error path.
   lecture, and a `warn` line says when the fallback is being used — if the
   syllabus ever starts carrying file lists again, that line goes quiet and the
   requests stop.
-- **Scrape and parse are decoupled.** A scrape completes even when the
-  sidecar is down; parsing/embedding of the PDFs it wrote is a separate,
-  idempotent pass (see [sidecar.md](./sidecar.md) and
-  [retrieval.md](./retrieval.md)).
-- **Parse requests are queued, not spawned per file.** Each new PDF used to
-  get its own detached thread, so a first sync of a full library fired every
-  deck at the sidecar at once — which FastAPI happily ran 40-wide, at ~2 GB
-  each. Two workers (`PARSE_WORKERS` in `app/src-tauri/src/sync.rs`) now drain
-  a channel, matching the sidecar's own cap; the rest wait without holding a
-  thread and a socket. Still fire-and-forget: the workers outlive the scrape
-  and drain when the engine drops.
+- **Scrape and parse are decoupled.** A scrape completes even when parsing
+  is unavailable; parsing the PDFs it wrote is a separate, idempotent pass.
+  The frontend's view of it (`download → parse → embed`, the third stage drawn
+  only when a Voyage key is stored), the `parse-status` / `embed-status` event
+  vocabularies and the background sweep that picks up what was missed are in
+  [frontend.md](./frontend.md). A finished parse queues that file's embedding
+  behind it, so a sync run reaches all three stages without a button — see
+  [retrieval.md](./retrieval.md).
+- **The parse is in this process, and it takes minutes.** `parse_pdf` in
+  `app/src-tauri/src/sync.rs` goes through the seam in
+  `app/src-tauri/src/parse/mod.rs` and blocks until the chosen backend is done.
+  The Python used to return in seconds — as soon as a fast pass had produced
+  some markdown — and finish the real parse on its own thread. There is no fast
+  tier now, so the call spans the whole of it, and no deadline is imposed from
+  here on either engine: the cloud client owns a 60-minute poll deadline, and a
+  local parse is a connect timeout followed by minutes of silence on this
+  machine's own CPU. Anything shorter could only abandon work still in
+  progress. A loopback POST does exist again, but it belongs to the local
+  backend behind the seam — `sync.rs` no longer knows a port is involved, which
+  is the part the sidecar's removal actually settled.
+- **Fire-and-forget is one detached thread per PDF**, and the bounded worker
+  pool that used to be here is gone. The pool existed because every parse was
+  an HTTP request and a full library meant a hundred simultaneous POSTs at ~2 GB
+  each. Concurrency is the backend's now, and the two answer it differently:
+  the cloud batches (`app/src-tauri/src/parse/mineru/batch.rs` — a
+  five-second/twenty-file window, eight batches in flight), while the local
+  engine takes a single permit (`app/src-tauri/src/parse/mineru/local.rs`),
+  because the server on the other end is this machine and works one document at
+  a time regardless. A gate back here would serve neither: it would only keep
+  cloud files out of the window they are meant to share. Each thread spends its
+  wait parked on a condvar or on that permit — no socket, no request in
+  flight.
+- **Finishing a parse writes its own page records**, into `pages` via
+  `store::upsert_pages`. That write used to live on the embed path, which made
+  the markdown `oculus grep` searches a side effect of building the vector
+  index. Hitting an *already*-parsed file folds its `.pages.json` in too, but
+  only when the file has no page rows at all — the library holds files parsed
+  before this write existed, and that is the repair path for them. See
+  [retrieval.md](./retrieval.md).
 - `app/src-tauri/src/md.rs` converts Canvas HTML bodies to markdown by
   refusing to descend into cruft nodes rather than stripping them first —
   same output as the old DOM-mutating converter, no mutable tree.

@@ -4,7 +4,9 @@ import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { ProviderMark } from "@/components/harness/ProviderMark";
+import type { ProviderHealth } from "@/hooks/useBridgeHealth";
 import { reasoningLabel, type HarnessModel, type Provider } from "@/lib/harness";
+import { navigateActive } from "@/lib/tabRouters";
 import { cn } from "@/lib/utils";
 
 /** Above this many models the menu grows a search box, as bb's does. */
@@ -16,8 +18,18 @@ export interface PickerProvider {
   models: HarnessModel[];
   /** The list is still being fetched — Codex asks its own CLI for one. */
   loading?: boolean;
-  /** A bridge is not ready; retain the row and selection for a later recheck. */
+  /** Keep a saved selection visible while its WSL bridge is unavailable. */
   unavailableReason?: string;
+  /** Whether this agent's CLI was found on this machine
+   *  (`app/src/hooks/useBridgeHealth.ts`). Optional, and absent reads as
+   *  `unknown`: a picker given no health draws the way it always did. */
+  health?: ProviderHealth;
+  /** What to say instead of "No models available" when this provider is
+   *  installed and its list is empty — `ProviderInfo.emptyNote` in
+   *  `app/src/lib/harness.ts`, carried through so the gate stays a field
+   *  rather than a test on an id. Unset for a provider whose empty list is
+   *  simply its CLI's answer. */
+  emptyNote?: string;
 }
 
 /**
@@ -26,9 +38,11 @@ export interface PickerProvider {
  *
  * The trigger reads `[mark] Model Name Level ⌄`; the menu is a strip of
  * provider tabs (marks, underlined when active), the models of the active
- * provider, and a row of reasoning levels under a rule. Picking a model
- * closes the menu, picking a level does not — the two are usually set
- * together, and the level is the fine adjustment after the coarse one.
+ * provider, and a row of reasoning levels under a rule. **Nothing inside
+ * closes it** — model, level and agent are one decision made in three clicks,
+ * and a menu that shut on the first of them sent you back to the trigger to
+ * finish the thought. It closes the way a menu you are done with closes:
+ * outside click, Escape, or the trigger again.
  *
  * There is no "default" on either row. A turn always names a model and a
  * level, so what the composer shows is what the CLI is told — nothing is
@@ -37,6 +51,17 @@ export interface PickerProvider {
  *
  * Levels come off the *model*, not the provider: `claude --effort` takes
  * five, while Codex declares its own per model.
+ *
+ * **An agent that is not installed says so here, where the choice is made.**
+ * The menu has three answers about a provider's models and they are not the
+ * same answer: health has not come back yet (draw what we always drew), the
+ * binary was not found (name the CLI and offer the way to Settings → AI), and
+ * the CLI is there but reported nothing — an opencode with no credentials —
+ * which is still "No models available". The first was the whole bug: Claude's
+ * catalogue is compiled in, so a student without Claude Code browsed a full
+ * list and learned the truth from an error row after sending. Health is a
+ * field on `PickerProvider` rather than a test on an id, so this stays one
+ * gate for three agents and costs a fourth nothing.
  */
 export function ModelPicker({
   providers,
@@ -73,7 +98,11 @@ export function ModelPicker({
     if (!open) setQuery("");
   }, [open]);
 
-  const showSearch = models.length > SEARCH_THRESHOLD;
+  // The active agent has no binary behind it: its catalogue is not offered,
+  // whether it was compiled in or fetched.
+  const missing = active?.health === "missing";
+
+  const showSearch = !missing && models.length > SEARCH_THRESHOLD;
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return models;
@@ -84,7 +113,7 @@ export function ModelPicker({
 
   // Levels come off the picked model. The only moment without one is the beat
   // before a provider's list arrives, and the row is hidden until it does.
-  const levels = selected?.reasoningEfforts ?? [];
+  const levels = missing ? [] : selected?.reasoningEfforts ?? [];
   const level = reasoning && levels.includes(reasoning) ? reasoning : null;
 
   // A model id with no row is one this build does not know — a Codex model
@@ -92,7 +121,13 @@ export function ModelPicker({
   // pretending nothing is selected.
   const label = selected?.label ?? model;
   const levelText = level ? reasoningLabel(level) : null;
-  const title = [active?.label, selected?.id ?? model, active?.unavailableReason, levelText && `${levelText} reasoning`]
+  const title = [
+    active?.label,
+    selected?.id ?? model,
+    levelText && `${levelText} reasoning`,
+    missing && "not installed",
+    active?.unavailableReason,
+  ]
     .filter(Boolean)
     .join(" · ");
 
@@ -132,13 +167,24 @@ export function ModelPicker({
           <div className="flex shrink-0 items-center gap-0.5 border-b border-border bg-surface px-2.5 pt-1">
             {providers.map((p) => {
               const isActive = p.id === provider;
+              // An agent with no CLI behind it is dimmed, not dropped: a
+              // student has to be able to see that Codex exists and is not
+              // here. It stays clickable for the same reason — the panel it
+              // switches to is the only thing that says *why*, and the way to
+              // Settings → AI is inside it.
+              const gone = p.health === "missing";
               return (
                 <button
                   key={p.id}
                   type="button"
-                  aria-label={p.label}
-                  title={p.unavailableReason ?? (providerLocked && !isActive ? `${p.label} — start a new chat to switch` : p.label)}
-                  disabled={!!p.unavailableReason || (providerLocked && !isActive)}
+                  title={
+                    providerLocked && !isActive
+                      ? `${p.label} — start a new chat to switch`
+                      : gone
+                        ? `${p.label} — not installed`
+                        : p.label
+                  }
+                  disabled={providerLocked && !isActive}
                   onMouseDown={(e) => e.preventDefault()}
                   onClick={() => {
                     if (p.id !== provider) onProvider(p.id);
@@ -148,6 +194,7 @@ export function ModelPicker({
                     isActive
                       ? "border-foreground text-foreground"
                       : "border-transparent text-muted-foreground enabled:hover:text-foreground",
+                    gone && !isActive && "opacity-40",
                   )}
                 >
                   <ProviderMark provider={p.id} className="size-4" />
@@ -172,35 +219,72 @@ export function ModelPicker({
         ) : null}
 
         <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-1 pb-1">
-          <SectionLabel>Model</SectionLabel>
-
           {active?.unavailableReason ? (
-            <div className="px-2 py-1.5 text-xs text-muted-foreground">{active.unavailableReason}</div>
-          ) : active?.loading ? (
-            <div className="px-2 py-1.5 text-xs text-muted-foreground">Loading models…</div>
-          ) : filtered.length === 0 ? (
-            <div className="px-2 py-1.5 text-xs text-muted-foreground">
-              {query ? "No models match your search" : "No models available"}
-            </div>
+            <EmptyNote note={active.unavailableReason} onSettings={() => {
+              setOpen(false);
+              navigateActive("/settings/ai");
+            }} />
+          ) : missing ? (
+            <NotInstalled
+              label={active?.label ?? ""}
+              onSettings={() => {
+                setOpen(false);
+                navigateActive("/settings/ai");
+              }}
+            />
           ) : (
-            filtered.map((m) => (
-              <ModelRow
-                key={m.id}
-                label={m.label}
-                description={m.description}
-                title={m.id}
-                selected={m.id === model}
-                onClick={() => {
-                  onModel(m.id);
-                  // A level the new model does not take would be rejected by
-                  // the CLI, so it falls back to that model's own default.
-                  if (!reasoning || !m.reasoningEfforts.includes(reasoning)) {
-                    onReasoning(m.defaultReasoningEffort ?? m.reasoningEfforts[0] ?? null);
-                  }
-                  setOpen(false);
-                }}
-              />
-            ))
+            <>
+              <SectionLabel>Model</SectionLabel>
+
+              {active?.loading ? (
+                <div className="px-2 py-1.5 text-xs text-muted-foreground">Loading models…</div>
+              ) : filtered.length === 0 ? (
+                query ? (
+                  <div className="px-2 py-1.5 text-xs text-muted-foreground">
+                    No models match your search
+                  </div>
+                ) : active?.emptyNote ? (
+                  // The CLI is here and its list is empty *because of something
+                  // the student can change* — opencode's catalogue is filtered
+                  // by what Settings has checked, so an untouched install
+                  // legitimately offers nothing. `missing` never reaches this
+                  // branch, so what is left is an installed agent, or one whose
+                  // health has not landed; both are the same dead end without
+                  // the note. This is the one place the gate becomes visible to
+                  // someone who never opened Settings, so it must read as a
+                  // step that is missing rather than as a broken menu.
+                  <EmptyNote
+                    note={active.emptyNote}
+                    onSettings={() => {
+                      setOpen(false);
+                      navigateActive("/settings/ai");
+                    }}
+                  />
+                ) : (
+                  <div className="px-2 py-1.5 text-xs text-muted-foreground">
+                    No models available
+                  </div>
+                )
+              ) : (
+                filtered.map((m) => (
+                  <ModelRow
+                    key={m.id}
+                    label={m.label}
+                    description={m.description}
+                    title={m.id}
+                    selected={m.id === model}
+                    onClick={() => {
+                      onModel(m.id);
+                      // A level the new model does not take would be rejected by
+                      // the CLI, so it falls back to that model's own default.
+                      if (!reasoning || !m.reasoningEfforts.includes(reasoning)) {
+                        onReasoning(m.defaultReasoningEffort ?? m.reasoningEfforts[0] ?? null);
+                      }
+                    }}
+                  />
+                ))
+              )}
+            </>
           )}
         </div>
 
@@ -241,6 +325,52 @@ export function ModelPicker({
         ) : null}
       </PopoverContent>
     </Popover>
+  );
+}
+
+/**
+ * What the menu shows instead of a catalogue when the agent's binary was not
+ * found. It names the CLI — "No models available" did not, and was the same
+ * sentence an installed opencode with no credentials gets — and it carries the
+ * one action that changes anything, which is Settings → AI, where the path,
+ * the version and the override variable are.
+ *
+ * It navigates through `navigateActive`: the picker is drawn inside a pane but
+ * a popover has no router of its own to `useNavigate` against, and that
+ * function is how the rest of the shell moves the active tab.
+ */
+function NotInstalled({ label, onSettings }: { label: string; onSettings: () => void }) {
+  return (
+    <div className="px-2 py-3">
+      <div className="text-xs text-foreground">{label} is not installed</div>
+      <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+        Chat runs the CLI from this machine, so there is nothing to send to until it is
+        on your PATH.
+      </p>
+      <Button variant="outline" size="xs" className="mt-2.5" onClick={onSettings}>
+        Open Settings → AI
+      </Button>
+    </div>
+  );
+}
+
+/**
+ * An empty catalogue that has a reason and a way out — `ProviderInfo.emptyNote`
+ * (`app/src/lib/harness.ts`), which today only opencode sets.
+ *
+ * It is the same panel as `NotInstalled` minus the claim about the binary: the
+ * sentence comes from the provider rather than from here, so the picker still
+ * names no provider, and the one action is the same route into Settings → AI
+ * through `navigateActive`, since a popover has no router of its own.
+ */
+function EmptyNote({ note, onSettings }: { note: string; onSettings: () => void }) {
+  return (
+    <div className="px-2 py-3">
+      <p className="text-[11px] leading-relaxed text-muted-foreground">{note}</p>
+      <Button variant="outline" size="xs" className="mt-2.5" onClick={onSettings}>
+        Open Settings → AI
+      </Button>
+    </div>
   );
 }
 

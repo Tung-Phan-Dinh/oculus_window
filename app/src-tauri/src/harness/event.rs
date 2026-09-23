@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 pub enum Provider {
     Claude,
     Codex,
+    Opencode,
+    Antigravity,
 }
 
 impl Provider {
@@ -28,6 +30,8 @@ impl Provider {
         match self {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
+            Provider::Opencode => "opencode",
+            Provider::Antigravity => "antigravity",
         }
     }
 
@@ -35,6 +39,8 @@ impl Provider {
         match s {
             "claude" => Some(Provider::Claude),
             "codex" => Some(Provider::Codex),
+            "opencode" => Some(Provider::Opencode),
+            "antigravity" => Some(Provider::Antigravity),
             _ => None,
         }
     }
@@ -43,6 +49,14 @@ impl Provider {
         match self {
             Provider::Claude => "Claude Code",
             Provider::Codex => "Codex",
+            // Lowercase is the project's own branding, and the frontend's
+            // `PROVIDERS` entry spells it the same way.
+            Provider::Opencode => "opencode",
+            // The product is "Antigravity"; the binary is `agy`. A student
+            // reads the former and types the latter, so the label is the
+            // product and `discover::binary_name` is the only place the
+            // three letters appear.
+            Provider::Antigravity => "Antigravity",
         }
     }
 }
@@ -135,6 +149,16 @@ pub enum HarnessEvent {
         ok: bool,
         /// Output or error text, capped by the bridge.
         output: String,
+        /// A row title the provider only knew once the call was over, which
+        /// replaces the one [`Self::ToolStarted`] opened with.
+        ///
+        /// Codex's web search is why it exists: its `item/started` carries an
+        /// empty `query` and the real queries arrive with the results, so a
+        /// search row could otherwise never say what was searched for — the
+        /// one thing Claude's `WebSearch` row says from its first event.
+        /// `None` everywhere else, and `None` leaves the row's title alone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
     },
     Usage {
         input_tokens: u64,
@@ -180,27 +204,106 @@ pub enum HarnessEvent {
         /// `completed`, `interrupted`, `failed`.
         status: String,
     },
-    Error { message: String },
+    Error {
+        message: String,
+        /// Set when the message is the provider saying it has no usable
+        /// credentials. The timeline draws such a row as a sign-in card
+        /// rather than red text, so this is the difference between an error
+        /// a student can act on and one they can only read.
+        auth: Option<Provider>,
+    },
     /// The provider process is gone. The thread stays; the next message
     /// resumes it.
     Exited { code: Option<i32> },
 }
 
 impl HarnessEvent {
+    /// An error with no provider behind it — the manager failing to start a
+    /// bridge, a job that never reached a CLI. `auth` is `None` because there
+    /// is nothing for a student to sign in to.
     pub fn error(message: impl Into<String>) -> Self {
         HarnessEvent::Error {
             message: message.into(),
+            auth: None,
         }
+    }
+
+    /// An error the named provider reported, classified: if it reads as a
+    /// credentials failure, the row says which agent to sign in to.
+    ///
+    /// The classification lives in [`signin::is_auth_failure`](super::signin::is_auth_failure)
+    /// rather than here, because it is the same judgement the sign-in dialog
+    /// makes and there should only be one copy of it. It is deliberately
+    /// narrow: a row that offers a sign-in over an unrelated failure sends a
+    /// student to re-authenticate and leaves them with the same error and one
+    /// less reason to trust the card.
+    pub fn error_for(provider: Provider, message: impl Into<String>) -> Self {
+        let message = message.into();
+        let auth = super::signin::is_auth_failure(provider, &message).then_some(provider);
+        HarnessEvent::Error { message, auth }
     }
 }
 
 /// Classify a tool by its raw name and input. Provider-specific names are
-/// mapped here so both bridges share one table.
+/// mapped here so all three bridges share one table.
+///
+/// The three CLIs spell their tools differently and, worse, spell their
+/// *arguments* differently. Claude sends `Read { file_path }`; opencode's
+/// runner sends `read { path }` — measured off the wire, not off its
+/// `/experimental/tool` registry, which still advertises `filePath`. So the
+/// lowercase names below have their own arms wherever the accessor differs,
+/// and only join a Claude arm where the key is genuinely the same
+/// (`command`, `pattern`, `url`). A fall-through would have titled every
+/// opencode file row with an empty string, which looks like a missing title
+/// rather than a wrong lookup.
 pub fn classify(name: &str, input: &serde_json::Value) -> (ToolKind, String) {
     let s = |k: &str| input.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    // Antigravity is the fourth spelling of the same handful of tools, and the
+    // only one that **PascalCases its parameters**: `run_command` takes
+    // `CommandLine` and `view_file` takes `AbsolutePath` — both read off the
+    // wire from `agy` 1.2.9, not from a schema. A lowercase fall-through would
+    // have titled every one of its rows with an empty string, which is exactly
+    // the failure opencode's `path`-vs-`file_path` arms are already here for.
+    //
+    // The two above are measured. The rest of the keys in each list are the
+    // same convention applied to the tool names in `agy`'s own `init.tools`,
+    // and are there so a row is titled rather than blank if the guess is
+    // right; narrow each list as a recording confirms it.
+    let any = |ks: &[&str]| {
+        ks.iter()
+            .find_map(|k| input.get(*k).and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string()
+    };
     let base = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
     match name {
-        "Bash" | "commandExecution" => {
+        // Antigravity's own names, off the `tools` array its `init` event
+        // prints. `CommandLine` and `AbsolutePath` are measured; see above.
+        "run_command" => {
+            let cmd = any(&["CommandLine", "Command"]);
+            let kind = if is_oculus_cli(&cmd) { ToolKind::OculusCli } else { ToolKind::Bash };
+            (kind, cmd)
+        }
+        "view_file" | "read_resource" => (ToolKind::Read, base(&any(&["AbsolutePath", "TargetFile", "Path"]))),
+        "write_to_file" => (ToolKind::Write, base(&any(&["AbsolutePath", "TargetFile", "Path"]))),
+        "replace_file_content" | "multi_replace_file_content" | "sed_file" | "notebook_edit" => {
+            (ToolKind::Edit, base(&any(&["AbsolutePath", "TargetFile", "Path"])))
+        }
+        "list_dir" => (ToolKind::Search, base(&any(&["DirectoryPath", "AbsolutePath", "Path"]))),
+        "find_by_name" => (ToolKind::Search, any(&["Pattern", "Query", "SearchDirectory"])),
+        "grep_search" => (ToolKind::Search, any(&["Query", "SearchTerm", "Pattern"])),
+        "read_url_content" | "open_browser_url" => (ToolKind::Web, any(&["Url", "URL"])),
+        "search_web" => (ToolKind::Web, any(&["Query", "SearchTerm"])),
+        "manage_task" | "schedule" => (ToolKind::Plan, String::new()),
+        "invoke_subagent" | "define_subagent" | "browser_subagent" => {
+            (ToolKind::Task, any(&["Name", "Prompt", "TypeName"]))
+        }
+        // The agent asking the student something. There is nowhere for it to
+        // be answered from a timeline, so it is a row like any other.
+        "ask_question" | "ask_permission" | "ask_custom_permission" => {
+            (ToolKind::Other, any(&["Question", "Prompt"]))
+        }
+        "Bash" | "commandExecution" | "bash" => {
             let cmd = s("command");
             let kind = if is_oculus_cli(&cmd) {
                 ToolKind::OculusCli
@@ -214,10 +317,21 @@ pub fn classify(name: &str, input: &serde_json::Value) -> (ToolKind, String) {
         "Write" => (ToolKind::Write, base(&s("file_path"))),
         "NotebookEdit" => (ToolKind::Edit, base(&s("notebook_path"))),
         "fileChange" => (ToolKind::Edit, s("title")),
-        "Grep" | "Glob" => (ToolKind::Search, s("pattern")),
-        "WebSearch" => (ToolKind::Web, s("query")),
-        "WebFetch" | "webSearch" => (ToolKind::Web, s("url")),
-        "Task" | "Agent" | "collabAgentToolCall" => (
+        "Grep" | "Glob" | "grep" | "glob" => (ToolKind::Search, s("pattern")),
+        "WebSearch" | "websearch" | "webSearch" => (ToolKind::Web, s("query")),
+        "WebFetch" | "webfetch" => (ToolKind::Web, s("url")),
+        // opencode's own file tools. `path`, not `file_path`.
+        "read" => (ToolKind::Read, base(&s("path"))),
+        "edit" => (ToolKind::Edit, base(&s("path"))),
+        "write" => (ToolKind::Write, base(&s("path"))),
+        "list" => (ToolKind::Search, base(&s("path"))),
+        // One tool for a whole multi-file patch; the row is titled with the
+        // first file the patch names, which is the one an `*** Update File:`
+        // header carries.
+        "apply_patch" => (ToolKind::Edit, base(&patch_target(&s("patchText")))),
+        "skill" => (ToolKind::Other, s("name")),
+        "question" => (ToolKind::Other, String::new()),
+        "Task" | "Agent" | "collabAgentToolCall" | "task" => (
             ToolKind::Task,
             if s("description").is_empty() {
                 s("prompt").lines().next().unwrap_or("").to_string()
@@ -225,7 +339,7 @@ pub fn classify(name: &str, input: &serde_json::Value) -> (ToolKind, String) {
                 s("description")
             },
         ),
-        "TodoWrite" | "TaskCreate" | "TaskUpdate" | "TaskList" | "TaskGet" => {
+        "TodoWrite" | "TaskCreate" | "TaskUpdate" | "TaskList" | "TaskGet" | "todowrite" => {
             (ToolKind::Plan, String::new())
         }
         "Skill" => (ToolKind::Other, s("skill")),
@@ -239,6 +353,22 @@ pub fn classify(name: &str, input: &serde_json::Value) -> (ToolKind, String) {
             (ToolKind::Other, String::new())
         }
     }
+}
+
+/// The first file an `apply_patch` envelope names. The patch text is a
+/// sequence of `*** Add File: p` / `*** Update File: p` / `*** Delete File: p`
+/// headers; anything else has no path in it and titles the row with nothing,
+/// which is what an unparseable patch deserves.
+fn patch_target(patch: &str) -> String {
+    for line in patch.lines() {
+        let line = line.trim();
+        for verb in ["*** Add File:", "*** Update File:", "*** Delete File:", "*** Move to:"] {
+            if let Some(rest) = line.strip_prefix(verb) {
+                return rest.trim().to_string();
+            }
+        }
+    }
+    String::new()
 }
 
 /// `oculus grep …`, `/path/to/oculus search …`, or the same behind an env
@@ -278,6 +408,31 @@ mod tests {
         assert_eq!(k, ToolKind::OculusCli);
         let (k, _) = classify("Bash", &serde_json::json!({"command": "ls myoculus"}));
         assert_eq!(k, ToolKind::Bash);
+    }
+
+    /// opencode's runner spells its tools in lowercase and its file argument
+    /// `path`. Letting those fall through to Claude's arms would have read
+    /// `file_path` off every one of them and titled the row with nothing.
+    #[test]
+    fn opencode_tool_names_are_titled_off_their_own_arguments() {
+        use serde_json::json;
+        assert_eq!(classify("read", &json!({"path": "../courses/COMP30026/w1.md"})), (ToolKind::Read, "w1.md".into()));
+        assert_eq!(classify("write", &json!({"path": "memories/a.md"})), (ToolKind::Write, "a.md".into()));
+        assert_eq!(classify("edit", &json!({"path": "memories/a.md"})), (ToolKind::Edit, "a.md".into()));
+        assert_eq!(classify("glob", &json!({"pattern": "**/*.md"})), (ToolKind::Search, "**/*.md".into()));
+        assert_eq!(classify("todowrite", &json!({"todos": []})), (ToolKind::Plan, String::new()));
+        assert_eq!(classify("skill", &json!({"name": "customize-opencode"})), (ToolKind::Other, "customize-opencode".into()));
+        // Bash is the one place the two CLIs agree on the argument name.
+        assert_eq!(
+            classify("bash", &json!({"command": "oculus files COMP30026"})),
+            (ToolKind::OculusCli, "oculus files COMP30026".into())
+        );
+        assert_eq!(
+            classify("apply_patch", &json!({"patchText": "*** Begin Patch\n*** Update File: memories/x.md\n@@\n-a\n+b\n*** End Patch"})),
+            (ToolKind::Edit, "x.md".into())
+        );
+        // Claude's own spelling is untouched by any of it.
+        assert_eq!(classify("Read", &json!({"file_path": "/a/b.md"})), (ToolKind::Read, "b.md".into()));
     }
 
     #[test]

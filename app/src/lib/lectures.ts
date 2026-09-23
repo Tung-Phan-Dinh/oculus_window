@@ -161,26 +161,127 @@ export const CHAPTER_PHASE_LABEL: Record<ChapterPhase, string> = {
  * Returns as soon as the run is claimed — it takes eight to eleven minutes, so
  * nothing waits on it. While it runs the lecture's `chapter_status` is
  * `running`; the end arrives as `LECTURE_CHAPTERS_EVENT`.
+ *
+ * `source` overrides which of the capture's streams is read. Leave it out and
+ * Rust measures it (`chapters::detect`) — which is right often enough that the
+ * override exists for the lecture where it is not, and for `--source` on the
+ * CLI.
  */
-export function findLectureChapters(lectureId: string, force = false): Promise<void> {
-  return invoke("lecture_find_chapters", { lectureId, force });
+export function findLectureChapters(
+  lectureId: string,
+  force = false,
+  source?: SourceNum
+): Promise<void> {
+  return invoke("lecture_find_chapters", { lectureId, force, source });
+}
+
+// ── Reading copy ─────────────────────────────────────────────────────────────
+
+/** Rust's own event (`reading::app::LECTURE_READING_EVENT`), the reading-copy
+ *  job's sibling of `LECTURE_CHAPTERS_EVENT` and separate from it for the
+ *  same reason the two jobs are separate: either can finish while the other
+ *  has never been run. */
+export const LECTURE_READING_EVENT = "lecture-reading";
+
+/** How a reading-copy run ended. `lines` is how many were written — which on
+ *  an `error` can still be more than zero, because the job commits window by
+ *  window and the ones before the failure are kept (docs/chapters.md). */
+export interface ReadingRunFinished {
+  lectureId: string;
+  status: "ready" | "error";
+  lines: number;
+  error: string | null;
+}
+
+/** Rust's step report while a reading copy is in flight
+ *  (`reading::app::LECTURE_READING_PROGRESS_EVENT`). */
+export const LECTURE_READING_PROGRESS_EVENT = "lecture-reading-progress";
+
+/** Which part of the reading-copy job is running. There is no `naming` here:
+ *  the reply arriving means one window is decided, not the whole lecture, and
+ *  the window counter already says that. */
+export type ReadingPhase = "decoding" | "frames" | "agent" | "writing";
+
+/**
+ * What the reading-copy run is doing right now.
+ *
+ * `window` is the one thing a chaptering run has no equivalent of, and it is
+ * the reason this job can be honest about its progress where the other cannot:
+ * a reading copy is a sequence of countable agent turns, so "window 3 of 7" is
+ * a real fraction rather than an estimate of a single turn that has not
+ * answered.
+ */
+export interface ReadingRunProgress {
+  lectureId: string;
+  phase: ReadingPhase;
+  detail: string | null;
+  kind: ToolKind | null;
+  done: number | null;
+  total: number | null;
+  window: { done: number; total: number } | null;
+}
+
+export const READING_PHASE_LABEL: Record<ReadingPhase, string> = {
+  decoding: "Watching the recording",
+  frames: "Grabbing slide frames",
+  agent: "Writing the reading copy",
+  writing: "Saving lines",
+};
+
+/**
+ * Write a reading copy with the agent the `lectureReading` job is configured
+ * with (Settings → AI), the same job `oculus lecture reading` runs.
+ *
+ * Returns as soon as the run is claimed. It needs both the recording *and* the
+ * transcript — the copy is a rewrite of the transcript, so none of it is
+ * optional reading — and Rust refuses the run outright without them.
+ *
+ * `source` is `findLectureChapters`': the two jobs decode the same file and
+ * choose the stream the same way.
+ */
+export function writeLectureReading(
+  lectureId: string,
+  force = false,
+  source?: SourceNum
+): Promise<void> {
+  return invoke("lecture_write_reading", { lectureId, force, source });
+}
+
+/** One stream's frame of the moment a dock message carries. */
+export interface MomentFrame {
+  /** Which stream it came off, 1 and 2 as Echo360 numbers them — the same
+   *  numbering the player's picker shows (`SOURCE_LABEL`). */
+  source: SourceNum;
+  /** Relative to `agents/`, the thread's cwd. */
+  path: string;
 }
 
 /**
- * One JPEG of the moment the playhead is at, for a message sent from the
- * player's dock.
+ * One JPEG per downloaded stream of the moment the playhead is at, for a
+ * message sent from the player's dock.
  *
- * **What comes back is the path the agent reads, not one the webview can
- * open**: `../lectures/<id>/frames/live/<seconds>.jpg`, relative to `agents/`,
- * which every thread runs from. The page never opens the file — it puts this
- * string in the message and the CLI opens it.
+ * **Every source on disk, not the one on screen.** Which stream carries the
+ * teaching is the theatre's business: a lecturer at the whiteboard leaves
+ * source 1 on the room's idle splash for the hour while the derivation is
+ * only ever on source 2, so a moment built from the visible pane alone hands
+ * the agent a picture of nothing. The message carries every view of that
+ * second and the agent reads whichever answers the question.
  *
- * ~200 ms: the grab probes a few offsets first, the same defence against a
- * black frame or the room's AV splash that a chaptering run's frames get
- * (docs/chapters.md). A lecture with no downloaded recording is refused.
+ * **What comes back are paths the agent reads, not ones the webview can
+ * open**: `../lectures/<id>/frames/live/<seconds>-source<n>.jpg`, relative to
+ * `agents/`, which every thread runs from. The page never opens the files —
+ * it puts the strings in the message and the CLI opens them.
+ *
+ * ~200 ms per stream: each grab probes a few offsets first, the same defence
+ * against a black frame or the room's AV splash that a chaptering run's
+ * frames get (docs/chapters.md). A stream that will not decode drops its own
+ * line; only a lecture with nothing downloaded is refused.
  */
-export function lectureGrabFrame(lectureId: string, seconds: number): Promise<string> {
-  return invoke<string>("lecture_grab_frame", { lectureId, seconds: Math.max(0, Math.floor(seconds)) });
+export function lectureGrabFrames(lectureId: string, seconds: number): Promise<MomentFrame[]> {
+  return invoke<MomentFrame[]>("lecture_grab_frames", {
+    lectureId,
+    seconds: Math.max(0, Math.floor(seconds)),
+  });
 }
 
 /**
@@ -198,8 +299,15 @@ export function chapterEnds(starts: number[], duration: number): number[] {
   return starts.map((s, i) => Math.max(s, i + 1 < starts.length ? starts[i + 1] : duration));
 }
 
-/** Which chapter second `t` falls in, or -1 before the first one starts. */
-export function chapterAt(starts: number[], t: number): number {
+/**
+ * Which span second `t` falls in, or -1 before the first one starts.
+ *
+ * Named for the shape rather than for chapters: a chapter set and a reading
+ * copy's lines are both an ordered list of starts with no ends, and "which one
+ * is the playhead in" is the same arithmetic over either. Two copies of it
+ * would be two places for an off-by-one to live.
+ */
+export function spanAt(starts: number[], t: number): number {
   let idx = -1;
   for (let i = starts.length - 1; i >= 0; i--) {
     if (t >= starts[i]) {

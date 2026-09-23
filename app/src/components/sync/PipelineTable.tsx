@@ -15,25 +15,38 @@ import {
 import { fmtAgo, fmtClock } from "@/lib/format";
 import {
   statusOf,
+  usePipelineStore,
   type PipelineItem,
   type PipelinePhase,
   type StageState,
 } from "@/stores/pipelineStore";
 
 /**
- * The full ingest ledger: one row per PDF, walking Download → Fast parse →
- * Quality parse → Embed. A row shows the stage dots and, for whatever is
- * running, a single percentage; clicking it expands a timeline of when each
- * step finished. Rows are ranked so live work sits on page one and finished
- * files fall to the back of the pages.
+ * The full ingest ledger: one row per PDF, walking Download → Parse → Embed. A
+ * row shows the stage dots and, for whatever is running, a single percentage;
+ * clicking it expands a timeline of when each step finished. Rows are ranked
+ * so live work sits on page one and finished files fall to the back of the
+ * pages.
+ *
+ * **The third dot is conditional.** With no Voyage key stored there is no
+ * embedder to wait for, so the stage is not drawn and a parsed file is
+ * finished at two dots — drawing a permanently grey dot for a stage that is
+ * switched off would read as a stall. `embedStage` in `pipelineStore` is the
+ * switch; it is set from `indexStore`, which owns readiness.
  */
 
-const STAGES = [
+const DOWNLOAD_PARSE = [
   { key: "download", label: "Download" },
-  { key: "fast", label: "Fast parse" },
-  { key: "quality", label: "Quality parse" },
-  { key: "embed", label: "Embed" },
+  { key: "parse", label: "Parse" },
 ] as const;
+
+const EMBED_STAGE = { key: "embed", label: "Embed" } as const;
+
+type Stage = (typeof DOWNLOAD_PARSE)[number] | typeof EMBED_STAGE;
+
+function stages(embedStage: boolean): readonly Stage[] {
+  return embedStage ? [...DOWNLOAD_PARSE, EMBED_STAGE] : DOWNLOAD_PARSE;
+}
 
 const DOT: Record<StageState, string> = {
   pending: "bg-muted-foreground/25",
@@ -62,11 +75,14 @@ const BADGE_VARIANT: Record<
   failed: "destructive",
 };
 
-/** Column template shared by the header and every row. */
+/** Column template shared by the header and every row. The stages column is
+ *  sized to its header rather than its dots: two dots and a connector are 30px,
+ *  narrower than the word "Stages". */
 const COLS =
-  "grid grid-cols-[minmax(0,1fr)_100px_118px_80px_minmax(120px,160px)] items-center gap-4 px-5";
+  "grid grid-cols-[minmax(0,1fr)_100px_60px_80px_minmax(120px,160px)] items-center gap-4 px-5";
 
-function StageDots({ item }: { item: PipelineItem }) {
+function StageDots({ item, embedStage }: { item: PipelineItem; embedStage: boolean }) {
+  const STAGES = stages(embedStage);
   return (
     <div className="flex items-center">
       {STAGES.map((s, i) => {
@@ -107,41 +123,54 @@ interface TimelineStep {
   detail?: string;
 }
 
-function timelineSteps(item: PipelineItem): TimelineStep[] {
-  const qualityDetail =
-    item.quality === "active"
+function timelineSteps(item: PipelineItem, embedStage: boolean): TimelineStep[] {
+  const parseDetail =
+    item.parse === "active"
       ? item.totalPages > 0
         ? `${item.pagesDone}/${item.totalPages} pages · ${Math.round((item.pagesDone / item.totalPages) * 100)}%`
         : "in progress"
-      : item.quality === "queued"
-        ? item.qualityQueuePos
-          ? item.qualityQueuePos === 1
+      : item.parse === "queued"
+        ? item.parseQueuePos
+          ? item.parseQueuePos === 1
             ? "next up"
-            : `#${item.qualityQueuePos} in line`
+            : `#${item.parseQueuePos} in line`
           : "queued"
-        : item.quality === "error"
+        : item.parse === "error"
           ? item.error
           : undefined;
 
+  // The embed detail is a page fraction and nothing else, because that is the
+  // only thing that moves: one document is one blocking call, and on the free
+  // Voyage programme it is ~2.8 pages a minute. A row that sat on "in
+  // progress" for an hour would be indistinguishable from a hang.
   const embedDetail =
     item.embed === "active"
       ? item.embedTotalPages > 0
         ? `${item.embedPagesDone}/${item.embedTotalPages} pages · ${Math.round((item.embedPagesDone / item.embedTotalPages) * 100)}%`
         : "in progress"
-      : item.embed === "error"
-        ? item.error
-        : undefined;
+      : item.embed === "queued"
+        ? "queued"
+        : item.embed === "error"
+          ? item.error
+          : undefined;
 
-  return [
+  const steps: TimelineStep[] = [
     { label: "Downloaded", state: item.download, time: item.downloadedAt },
-    { label: "Fast parse", state: item.fast, time: item.fastParsedAt },
-    { label: "Quality parse", state: item.quality, time: item.parsedAt, detail: qualityDetail },
-    { label: "Embed", state: item.embed, time: item.embeddedAt, detail: embedDetail },
+    { label: "Parse", state: item.parse, time: item.parsedAt, detail: parseDetail },
   ];
+  if (embedStage) {
+    steps.push({
+      label: "Embed",
+      state: item.embed,
+      time: item.embeddedAt,
+      detail: embedDetail,
+    });
+  }
+  return steps;
 }
 
-function Timeline({ item }: { item: PipelineItem }) {
-  const steps = timelineSteps(item);
+function Timeline({ item, embedStage }: { item: PipelineItem; embedStage: boolean }) {
+  const steps = timelineSteps(item, embedStage);
   return (
     <div className="px-9 pb-3 pt-1">
       <div className="ml-[3px]">
@@ -189,17 +218,24 @@ function Timeline({ item }: { item: PipelineItem }) {
 
 function Row({
   item,
+  embedStage,
   expanded,
   onToggle,
   onResume,
 }: {
   item: PipelineItem;
+  embedStage: boolean;
   expanded: boolean;
   onToggle: () => void;
   onResume?: (item: PipelineItem) => void;
 }) {
-  const s = statusOf(item);
-  const resumable = onResume && (s.phase === "paused" || s.phase === "failed");
+  const s = statusOf(item, embedStage);
+  // A parsed file with its embedding still outstanding gets the same ▶ as a
+  // paused one, and that is the point of the third stage being here: the
+  // backlog is not swept up automatically, so this is how one file is sent
+  // without committing to the whole library from the settings page.
+  const embedNow = embedStage && item.parse === "done" && item.embed === "pending";
+  const resumable = onResume && (s.phase === "paused" || s.phase === "failed" || embedNow);
   const percent =
     s.phase === "active" && s.percent != null ? Math.round(s.percent) : null;
 
@@ -226,7 +262,7 @@ function Row({
 
         <span className="text-[11px] text-muted-foreground truncate">{item.code}</span>
 
-        <StageDots item={item} />
+        <StageDots item={item} embedStage={embedStage} />
 
         <StageDates item={item} />
 
@@ -240,7 +276,7 @@ function Row({
                 <Button
                   variant="ghost"
                   size="icon-xs"
-                  aria-label={s.phase === "failed" ? "Retry" : "Resume"}
+                  aria-label={s.phase === "failed" ? "Retry" : embedNow ? "Embed" : "Resume"}
                   onClick={(e) => {
                     e.stopPropagation();
                     onResume(item);
@@ -251,7 +287,11 @@ function Row({
                 </Button>
               </TooltipTrigger>
               <TooltipContent>
-                {s.phase === "failed" ? "Retry from the failed stage" : "Resume where it left off"}
+                {s.phase === "failed"
+                  ? "Try this file again"
+                  : embedNow
+                    ? "Embed this file now"
+                    : "Resume where it left off"}
               </TooltipContent>
             </Tooltip>
           )}
@@ -261,7 +301,7 @@ function Row({
         </div>
       </div>
 
-      {expanded && <Timeline item={item} />}
+      {expanded && <Timeline item={item} embedStage={embedStage} />}
     </div>
   );
 }
@@ -269,12 +309,7 @@ function Row({
 /** Most recent stage timestamp, with the full breakdown one click away in the
  *  row's timeline. */
 function StageDates({ item }: { item: PipelineItem }) {
-  const latest = Math.max(
-    item.downloadedAt ?? 0,
-    item.fastParsedAt ?? 0,
-    item.parsedAt ?? 0,
-    item.embeddedAt ?? 0,
-  );
+  const latest = Math.max(item.downloadedAt ?? 0, item.parsedAt ?? 0);
   if (!latest) return <span className="text-[11px] text-muted-foreground/60">—</span>;
   return (
     <span className="text-[11px] text-muted-foreground tabular-nums">{fmtAgo(latest)}</span>
@@ -291,11 +326,13 @@ const PHASE_RANK: Record<PipelinePhase, number> = {
   done: 4,
 };
 
-function byActivity(a: PipelineItem, b: PipelineItem): number {
-  const ra = PHASE_RANK[statusOf(a).phase];
-  const rb = PHASE_RANK[statusOf(b).phase];
-  if (ra !== rb) return ra - rb;
-  return b.updatedAt - a.updatedAt;
+function byActivity(embedStage: boolean) {
+  return (a: PipelineItem, b: PipelineItem): number => {
+    const ra = PHASE_RANK[statusOf(a, embedStage).phase];
+    const rb = PHASE_RANK[statusOf(b, embedStage).phase];
+    if (ra !== rb) return ra - rb;
+    return b.updatedAt - a.updatedAt;
+  };
 }
 
 /** Files per page. The ledger runs to hundreds of PDFs, and every row here
@@ -310,6 +347,7 @@ export function PipelineTable({
   onResume?: (item: PipelineItem) => void;
 }) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const embedStage = usePipelineStore((s) => s.embedStage);
 
   const toggle = (path: string) =>
     setExpanded((prev) => {
@@ -321,7 +359,10 @@ export function PipelineTable({
   // One list, ranked: running work first, finished rows last. Paging replaces
   // the old collapsed "Completed" group — live work is on page one either way,
   // and the footer says how much is behind it.
-  const sorted = useMemo(() => [...items].sort(byActivity), [items]);
+  const sorted = useMemo(
+    () => [...items].sort(byActivity(embedStage)),
+    [items, embedStage],
+  );
   const { page, pageCount, setPage, pageRows } = usePagedRows(sorted, PAGE_SIZE);
 
   return (
@@ -356,6 +397,7 @@ export function PipelineTable({
             <Row
               key={it.relativePath}
               item={it}
+              embedStage={embedStage}
               expanded={expanded.has(it.relativePath)}
               onToggle={() => toggle(it.relativePath)}
               onResume={onResume}

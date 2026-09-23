@@ -145,6 +145,19 @@ pub fn bridge() -> Result<Bridge, String> {
 pub fn forget() { *cache().lock().unwrap() = None; }
 
 impl Bridge {
+    /// Authentication is a fixed CLI operation, not an agent turn. The
+    /// supervisor gives it the Linux credential environment and kills it on
+    /// stdin EOF, including when a Windows sign-in dialog is cancelled.
+    pub fn auth_command(&self, login: bool) -> Command {
+        let mut command = crate::platform::command(&self.launcher);
+        command.args(["--distribution", &self.distro, "--exec", "python3", "-u", "-c",
+            SUPERVISOR, if login { "auth-login" } else { "auth-status" }]);
+        command.env_remove("WSLENV").env_remove("ANTHROPIC_API_KEY")
+            .env_remove("OPENAI_API_KEY").env_remove("CLAUDECODE")
+            .env_remove("CLAUDE_CODE_ENTRYPOINT");
+        command
+    }
+
     pub fn auth_error(&self) -> Option<String> {
         (!self.logged_in).then(|| format!("Sign in to Claude inside WSL2: wsl -d {} -- {} auth login. Then recheck the bridge.", self.distro, self.claude))
     }

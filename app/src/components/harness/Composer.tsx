@@ -1,57 +1,27 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { FileText, PaperPlaneTilt, Stop } from "@phosphor-icons/react";
+import { useEffect, useRef, useState } from "react";
+import { PaperPlaneTilt, Stop } from "@phosphor-icons/react";
 import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
-import { ModelPicker, type PickerProvider } from "@/components/harness/ModelPicker";
+import { MentionInput, type MentionInputHandle } from "@/components/harness/MentionInput";
+import { MentionMenu } from "@/components/harness/MentionMenu";
+import { useMentionMenu } from "@/components/harness/useMentionMenu";
+import { ModelPicker } from "@/components/harness/ModelPicker";
 import { UsageMeter } from "@/components/harness/UsageMeter";
 import { SubjectSelect } from "@/components/harness/SubjectSelect";
-import { fileTitle } from "@/lib/openFile";
-import { displayCode } from "@/lib/format";
-import { searchMentionFiles, type MentionFile, type Subject } from "@/lib/db";
+import { type Subject } from "@/lib/db";
 import {
-  CLAUDE_MODELS,
-  codexAsModels,
   defaultSelection,
-  harnessCodexModels,
-  type CodexModel,
+  providerLabel,
   type Provider,
   type RateWindow,
   type ThreadUsage,
 } from "@/lib/harness";
+import { useProviderModels } from "@/hooks/useProviderModels";
+import { useAttachments } from "@/hooks/useAttachments";
+import { AttachmentStrip } from "@/components/harness/AttachmentStrip";
+import { withAttachments } from "@/lib/attachments";
+import { signInState, useSignInStatus } from "@/hooks/useSignInStatus";
+import { SignInDialog, useSignIn } from "@/components/harness/SignInDialog";
 import { cn } from "@/lib/utils";
-import { useHarnessProviders } from "@/hooks/useHarnessProviders";
-
-/** How much of an `@` token to look at. Long enough for a real filename,
- *  short enough that a stray `@` in prose stops matching once the sentence
- *  runs on. */
-const MAX_MENTION = 60;
-
-/** The empty box is exactly one line tall. Both halves of the autosize below
- *  measure against this, so it has to stay the textarea's own line-height. */
-const LINE_H = 16;
-
-/** Roughly ten lines. Past that the box stops growing and scrolls. */
-const MAX_H = 160;
-
-/** The gap the `@` menu keeps from the composer and from the viewport edge —
- *  `mb-2`/`mt-2`, in pixels, because the flip below has to do arithmetic with
- *  it. */
-const MENU_GAP = 8;
-
-/**
- * The `@…` token the caret is sitting in, or null.
- *
- * Anchored to the start of a word so an email address or a handle typed
- * mid-word never opens the menu, and ended by whitespace so the token is
- * whatever was typed after the `@`.
- */
-export function mentionQuery(
-  text: string,
-  caret: number,
-): { query: string; start: number } | null {
-  const m = new RegExp(`(?:^|\\s)@([^\\s@]{0,${MAX_MENTION}})$`).exec(text.slice(0, caret));
-  return m ? { query: m[1], start: caret - m[1].length - 1 } : null;
-}
 
 /**
  * One box: the text, then a row carrying the model picker on the left and the
@@ -79,7 +49,19 @@ export function mentionQuery(
  * writes its **library path** into the message — nothing is read here and no
  * content is attached. The agent has the library in front of it and its own
  * tools for opening a file; a path is all it was ever missing, and one it can
- * hand straight to `oculus read`.
+ * hand straight to `oculus read`. The box *draws* that path as a chip
+ * carrying the file's own glyph and display name (`MentionInput.tsx` over the
+ * shared `app/src/components/markdown/FileChip.tsx`, which the thread's own
+ * bubbles use too), which is why the text here is not the box's value but its
+ * serialization: what is read out of the editor, checked for emptiness and
+ * handed to `onSend` is always the path form.
+ *
+ * The `@` machinery itself is no longer this file's: the token parser, the
+ * lookup, the list and its keys live in `./useMentionMenu.ts` and
+ * `./MentionMenu.tsx`, because a task body wants the same mentions
+ * (`app/src/pages/TaskPage.tsx`). What stays here is the only part that was
+ * ever the composer's — the scope it narrows to, and the Enter that sends
+ * when the menu is not the one claiming it.
  */
 export function Composer({
   provider,
@@ -128,71 +110,69 @@ export function Composer({
   onStop: () => void;
   autoFocus?: boolean;
 }) {
+  /** The message the box would send: chips already back in their path form.
+   *  Every emptiness check below reads this, not the editor. */
   const [text, setText] = useState("");
-  const providers = useHarnessProviders();
-  const ref = useRef<HTMLTextAreaElement>(null);
+  const ref = useRef<MentionInputHandle>(null);
+  /** The `@` menu, scoped to this thread's subject — `null` being the general
+   *  thread, which is the whole library. It positions itself at the caret and
+   *  needs nothing from this file to do it. */
+  const mentions = useMentionMenu({ subjectId, input: ref });
+  /** This whole box, for the file drop below: a drag is aimed at a surface,
+   *  and the surface is the box and its strip of attachments rather than the
+   *  editor's text. It is no longer the `@` menu's anchor — that is the caret
+   *  now — so it is this file's own ref. */
   const wrapRef = useRef<HTMLDivElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
-  const [codexModels, setCodexModels] = useState<CodexModel[] | null>(null);
-  const [mention, setMention] = useState<{ query: string; start: number } | null>(null);
-  const [files, setFiles] = useState<MentionFile[]>([]);
-  const [index, setIndex] = useState(0);
-  /** Which way the `@` menu opens. See the layout effect that sets it. */
-  const [drop, setDrop] = useState<"up" | "down">("down");
-  // The query the menu is currently showing, so a slow lookup that lands
-  // after the token changed cannot overwrite a newer list.
-  const latest = useRef("");
-  /** Where the caret goes once the picked path is in the DOM. */
-  const caretAfterPick = useRef<number | null>(null);
-
-  useEffect(() => {
-    if (autoFocus) ref.current?.focus();
-  }, [autoFocus]);
+  /**
+   * Pictures pasted or dropped in, still only in memory.
+   *
+   * They are written to the library on send and not before, so a screenshot
+   * pasted and then removed leaves nothing on disk; what goes out is their
+   * paths, appended to the message — the agent opens them itself, exactly as
+   * it opens a mention. The whole gesture is `useAttachments`, shared with the
+   * lecture dock's box so a drop means the same thing in both.
+   */
+  const att = useAttachments(wrapRef);
 
   // What stop gave back. It is put *before* anything already typed, because
-  // it was typed first, and the box is focused so the next key carries on
-  // where the student left off.
+  // it was typed first, and the box is focused with the caret at the end of
+  // it so the next key carries on where the student left off. Its mentions
+  // come back as chips rather than as the paths they were sent as — a
+  // restored message should read the way it read when it was typed.
   useEffect(() => {
     if (!restore) return;
-    setText((t) => [restore.text, t].filter(Boolean).join("\n\n"));
-    ref.current?.focus();
+    ref.current?.prepend(restore.text);
     onRestored?.();
   }, [restore, onRestored]);
 
-  // Codex lists its own models (`model/list`), fetched once the picker is
-  // for Codex; Claude's are the CLI's aliases.
-  useEffect(() => {
-    if (provider !== "codex" || codexModels) return;
-    harnessCodexModels().then(setCodexModels).catch(() => setCodexModels([]));
-  }, [provider, codexModels]);
+  // Only the provider the picker is on is worth asking a CLI about: a
+  // composer that is on Claude should not spawn the others for lists nobody
+  // has opened the menu to see.
+  const { providers: pickerProviders } = useProviderModels(provider);
 
-  useEffect(() => {
-    if (!mention) {
-      setFiles([]);
-      return;
-    }
-    const token = `${subjectId ?? ""} ${mention.query}`;
-    latest.current = token;
-    searchMentionFiles(subjectId, mention.query)
-      .then((found) => {
-        if (latest.current !== token) return;
-        setFiles(found);
-        setIndex(0);
-      })
-      .catch(() => {});
-  }, [mention, subjectId]);
+  /**
+   * The warning *before* the failure: the agent this box would send to has no
+   * credentials, said here rather than found out as a red row after sending.
+   *
+   * Three states, the discipline `providerHealth` already follows for the same
+   * reason: `unknown` — the probe has not landed, or this is opencode, whose
+   * store is per provider — draws **nothing at all**, because a line that
+   * flashed the wrong answer for a beat would be worse than no line. Only a
+   * measured `out` says so.
+   *
+   * And it never disables sending. The status is a cached read of a CLI's own
+   * store, which a student can change in a terminal without this app hearing
+   * about it; locking the box on a stale read would be the app refusing to do
+   * the one thing it is for.
+   */
+  const { statuses, recheck } = useSignInStatus();
+  const signedOut = signInState(statuses, provider) === "out";
+  const [signInOpen, setSignInOpen] = useState(false);
+  const signIn = useSignIn(recheck);
 
-  // A subject change re-scopes what `@` may reach, so the open list is stale.
-  useEffect(() => setMention(null), [subjectId]);
-
-  const pickerProviders: PickerProvider[] = providers.map((p) =>
-    p.id === "claude"
-      ? { ...p, models: CLAUDE_MODELS }
-      : { ...p, models: codexAsModels(codexModels ?? []), loading: codexModels === null },
-  );
-
-  // No turn goes out without a model and a level, so an empty selection —
-  // Codex before its CLI has answered — is filled the moment a list exists.
+  // No turn goes out without a model and a level, so an empty selection — a
+  // fetched catalogue before its CLI has answered — is filled the moment a
+  // list exists.
   const active = pickerProviders.find((p) => p.id === provider);
   useEffect(() => {
     if (model || !active || active.unavailableReason || active.loading || active.models.length === 0) return;
@@ -202,85 +182,33 @@ export function Composer({
     onReasoning(pick.reasoning);
   }, [model, active, onModel, onReasoning]);
 
-  /** Recompute the token from wherever the caret actually is: typing, but
-   *  also an arrow key or a click that lands beside an existing `@`. */
-  function syncMention(el: HTMLTextAreaElement) {
-    setMention(mentionQuery(el.value, el.selectionStart ?? el.value.length));
-  }
+  /** Whether there is a message at all: words, pictures, or both. */
+  const ready = text.trim().length > 0 || att.items.length > 0;
 
   /**
-   * The box grows to its content after every change, and a pick puts the
-   * caret back after the path it inserted.
+   * Send, or queue.
    *
-   * Both belong here rather than in the handlers that cause them: a pick
-   * writes through React, so at the moment it runs — and in a `requestAnimationFrame`
-   * after it — the textarea still holds the old text, and measuring or
-   * addressing it then sizes the box to the wrong string. A layout effect is
-   * the first point at which the DOM says what the state does.
+   * Pictures are written first and the message is only assembled once they
+   * are on disk: a path in a message that points at nothing is worse than a
+   * send that did not happen, so a refusal keeps the box exactly as it was
+   * and says why.
    */
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    el.style.height = `${LINE_H}px`;
-    el.style.height = `${Math.min(el.scrollHeight, MAX_H)}px`;
-    if (caretAfterPick.current != null) {
-      el.focus();
-      el.setSelectionRange(caretAfterPick.current, caretAfterPick.current);
-      caretAfterPick.current = null;
-    }
-  }, [text]);
-
-  /** Swap the `@token` for the file's library path, fenced so it reads as a
-   *  path rather than as part of the sentence. */
-  function pick(file: MentionFile) {
-    const el = ref.current;
-    if (!el || !mention) return;
-    const caret = el.selectionStart ?? text.length;
-    const token = `\`${file.relative_path}\` `;
-    setText(text.slice(0, mention.start) + token + text.slice(caret));
-    caretAfterPick.current = mention.start + token.length;
-    setMention(null);
-  }
-
-  const menuOpen = mention !== null && files.length > 0;
-
-  /**
-   * The `@` menu opens downwards, and only flips up when it would not fit.
-   *
-   * The composer is the same component in three very different places — the
-   * middle of the home page, the middle of the chat hero, and pinned to the
-   * bottom of an open thread — so which way is "out of the way" is a fact
-   * about the viewport, not about the call site. Opening up unconditionally
-   * was right for the thread and wrong everywhere else: on the home page the
-   * list covered the subject pill and the cards above it while the whole
-   * lower half of the page sat empty.
-   *
-   * Measured after the menu is in the DOM rather than against `max-h-64`, so
-   * a three-file list is judged on the ~90px it actually occupies instead of
-   * the 256px it is allowed. `useLayoutEffect`, so the flip lands before
-   * paint and the menu is never seen in the wrong place.
-   */
-  useLayoutEffect(() => {
-    const wrap = wrapRef.current;
-    const menu = menuRef.current;
-    if (!menuOpen || !wrap || !menu) return;
-    const box = wrap.getBoundingClientRect();
-    const needed = menu.offsetHeight + MENU_GAP;
-    setDrop(window.innerHeight - box.bottom >= needed || box.top < needed ? "down" : "up");
-  }, [menuOpen, files.length]);
-
-  const send = () => {
+  const send = async () => {
     const t = text.trim();
-    if (!t || active?.unavailableReason) return;
-    setText("");
-    setMention(null);
+    if ((!t && !att.items.length) || att.writing || active?.unavailableReason) return;
+
+    const paths = await att.flush();
+    if (!paths) return;
+
+    ref.current?.clear();
+    mentions.close();
     // Whether this goes out now or waits behind the running turn is Rust's
     // call, not this box's: it owns the queue and the order.
-    onSend(t);
+    onSend(withAttachments(t, paths));
   };
 
   return (
-    <div ref={wrapRef} className="relative flex flex-col gap-1.5">
+    <div ref={wrapRef} className="flex flex-col gap-1.5">
       {!subjectLocked && (
         <div className="flex items-center px-0.5">
           <SubjectSelect
@@ -292,91 +220,78 @@ export function Composer({
         </div>
       )}
 
-      {menuOpen && (
-        <div
-          ref={menuRef}
-          className={cn(
-            "absolute left-0 right-0 z-20 max-h-64 overflow-y-auto overflow-x-hidden rounded-xl border border-border bg-popover py-1 shadow-md",
-            drop === "down" ? "top-full mt-2" : "bottom-full mb-2",
-          )}
-        >
-          {files.map((f, i) => (
-            <button
-              key={f.id}
-              type="button"
-              onMouseDown={(e) => {
-                e.preventDefault();
-                pick(f);
-              }}
-              onMouseEnter={() => setIndex(i)}
-              className={cn(
-                "flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs",
-                i === index ? "bg-accent text-foreground" : "text-muted-foreground",
-              )}
-            >
-              <FileText size={12} className="shrink-0" />
-              <span className="truncate">{fileTitle(f)}</span>
-              {subjectId == null && (
-                <span className="ml-auto shrink-0 text-[10px] text-muted-foreground/70">
-                  {displayCode(f.subject_code)}
-                </span>
-              )}
-            </button>
-          ))}
+      {/* Where this sits in the tree no longer decides where it draws: it
+          portals out and hangs off the caret's own rect. It stays here
+          because this is the box it belongs to. */}
+      <MentionMenu {...mentions.menu} />
+
+      {att.error && (
+        <div className="px-0.5 text-[11px] text-destructive">{att.error}</div>
+      )}
+
+      {signedOut && (
+        <div className="flex items-center gap-1.5 px-0.5 text-[11px] text-muted-foreground">
+          <span>{providerLabel(provider)} is signed out.</span>
+          <button
+            type="button"
+            onClick={() => setSignInOpen(true)}
+            className="cursor-pointer text-brand underline-offset-2 hover:underline"
+          >
+            Sign in
+          </button>
         </div>
       )}
 
-      <div className="flex flex-col gap-4 rounded-xl border border-border bg-card px-3 py-3 shadow-sm transition-[border-color,box-shadow] focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/25">
-        {/* `overflow-x-hidden` below is load-bearing, not tidying. The box is
-            one line tall and a textarea soft-wraps, so there is never anything
-            to scroll sideways — but with macOS set to always show scrollbars
-            rather than overlay them, WebKit reserves and paints a horizontal
-            bar anyway, and in a 16px-tall box it lands across the text. */}
-        <Textarea
-          ref={ref}
-          value={text}
-          onChange={(e) => {
-            setText(e.target.value);
-            syncMention(e.currentTarget);
+      {signInOpen && (
+        <SignInDialog
+          provider={provider}
+          run={signIn.run?.provider === provider ? signIn.run : null}
+          onStart={() => signIn.start(provider)}
+          onCode={(code) => signIn.submitCode(code)}
+          onCancel={() => signIn.cancel()}
+          onClose={() => {
+            if (signIn.run?.result) signIn.clear();
+            setSignInOpen(false);
           }}
-          onKeyUp={(e) => syncMention(e.currentTarget)}
-          onClick={(e) => syncMention(e.currentTarget)}
-          onBlur={() => setMention(null)}
-          onKeyDown={(e) => {
-            if (menuOpen) {
-              if (e.key === "ArrowDown") {
-                e.preventDefault();
-                setIndex((i) => (i + 1) % files.length);
-                return;
-              }
-              if (e.key === "ArrowUp") {
-                e.preventDefault();
-                setIndex((i) => (i - 1 + files.length) % files.length);
-                return;
-              }
-              if (e.key === "Enter" || e.key === "Tab") {
-                e.preventDefault();
-                pick(files[index]);
-                return;
-              }
-              if (e.key === "Escape") {
-                e.preventDefault();
-                setMention(null);
-                return;
-              }
-            }
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              send();
-            }
-          }}
-          rows={1}
-          placeholder={
-            running ? "Working… your next message waits its turn" : "What would you like to work on?"
-          }
-          className="min-h-[16px] max-h-[160px] w-full resize-none overflow-x-hidden overflow-y-auto rounded-none border-0 bg-transparent p-0 text-[13px]! leading-[16px] shadow-none focus-visible:border-0 focus-visible:ring-0 dark:bg-transparent"
-          style={{ height: `${LINE_H}px` }}
         />
+      )}
+
+      <div
+        className={cn(
+          "flex flex-col gap-4 rounded-xl border border-border bg-card px-3 py-3 shadow-sm transition-[border-color,box-shadow] focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/25",
+          // A drag over the box says so on the box itself, in the same
+          // vocabulary focus uses — there is nowhere else for a drop target
+          // to be announced without a panel this app does not have.
+          att.dropping && "border-brand ring-[3px] ring-brand/25",
+        )}
+      >
+        <div className="flex flex-col gap-2">
+          <AttachmentStrip items={att.items} onDetach={att.detach} />
+          <MentionInput
+            ref={ref}
+            autoFocus={autoFocus}
+            onEdit={(next, caret) => {
+              setText(next);
+              mentions.track(next, caret);
+            }}
+            onFiles={att.attach}
+            onBlur={mentions.close}
+            onKeyDown={(e) => {
+              // The menu's keys first, and only its own: anything it claims
+              // comes back prevented, so Enter-sends below never fires on the
+              // keystroke that picked a file.
+              mentions.keyDown(e);
+              if (e.defaultPrevented) return;
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                void send();
+              }
+            }}
+            placeholder={
+              running ? "Working… your next message waits its turn" : "What would you like to work on?"
+            }
+          />
+        </div>
         <div className="flex items-center gap-1">
           <ModelPicker
             className="-ml-1.5"
@@ -396,11 +311,11 @@ export function Composer({
               <Stop weight="fill" />
             </Button>
           )}
-          {(!running || text.trim()) && (
+          {(!running || ready) && (
             <Button
               size="icon-xs"
-              disabled={!text.trim() || !!active?.unavailableReason}
-              onClick={send}
+              disabled={!ready || att.writing || !!active?.unavailableReason}
+              onClick={() => void send()}
               className="shrink-0"
               aria-label={running ? "Queue" : "Send"}
             >

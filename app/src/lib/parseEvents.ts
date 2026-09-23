@@ -3,12 +3,12 @@ import { useParseStore, type ParseJob } from "@/stores/parseStore";
 import { usePipelineStore } from "@/stores/pipelineStore";
 import type { SyncWriteQueue } from "@/lib/syncWrites";
 
-/** Stage-only signals must not be persisted as files.parse_status. */
-const PARSE_STATUSES = new Set(["fast", "quality", "queued", "running", "error"]);
+/** Rust has one parse stage. The historical quality success is retained in
+ * the database; embedding reports its own independent embed-status event. */
+const PARSE_STATUSES = new Set(["quality", "queued", "running", "error"]);
 
-/** Keep the stale-heartbeat check, database commit and visible stage change in
- *  one queued operation. Checking before the queue lets a trailing heartbeat
- *  overtake a quality completion that is still waiting behind file writes. */
+/** Keep stale-heartbeat checks, commits and visible progress in one queue,
+ * after scrape-file inserts. A completed parse must never embed a missing row. */
 export function queueParseEvent(
   writes: SyncWriteQueue,
   runId: number | null,
@@ -17,71 +17,42 @@ export function queueParseEvent(
   onError: (message: string) => void,
 ): Promise<boolean> {
   const path = ev.relative_path;
-  if (!path) return Promise.resolve(false);
+  if (!path || !PARSE_STATUSES.has(ev.status)) return Promise.resolve(false);
   return writes.enqueue(runId, `Saving parse status for ${path}`, async () => {
-    if (ev.status === "running" && usePipelineStore.getState().items[path]?.quality === "done") return;
-
-    if (PARSE_STATUSES.has(ev.status)) {
-      await setParseStatus(ev.subject_id, path, ev.status);
-      useParseStore.getState().update(ev);
-    }
-
+    if (ev.status === "running" && usePipelineStore.getState().items[path]?.parse === "done") return;
+    await setParseStatus(ev.subject_id, path, ev.status);
+    useParseStore.getState().update(ev);
     const touch = usePipelineStore.getState().touch;
     switch (ev.status) {
-      case "parsing":
-        touch(path, ev.subject_id, { download: "done", fast: "active" });
-        break;
-      case "fast":
-        touch(path, ev.subject_id, { download: "done", fast: "done", fastParsedAt: Date.now() });
-        break;
       case "queued":
         touch(path, ev.subject_id, {
-          download: "done", fast: "done", quality: "queued", qualityQueuePos: ev.position,
+          download: "done", parse: "queued", parseQueuePos: ev.position,
         });
         break;
       case "running":
         touch(path, ev.subject_id, {
-          download: "done", fast: "done", quality: "active",
-          pagesDone: ev.pages_done ?? 0, totalPages: ev.total_pages ?? 0,
-          qualityQueuePos: undefined,
+          download: "done", parse: "active", pagesDone: ev.pages_done ?? 0,
+          totalPages: ev.total_pages ?? 0, parseQueuePos: undefined,
         });
         break;
       case "quality":
         touch(path, ev.subject_id, {
-          download: "done", fast: "done", quality: "done", parsedAt: Date.now(),
+          download: "done", parse: "done", parsedAt: Date.now(),
+          error: undefined, errorKind: undefined,
+          errorRetryable: undefined, errorLatching: undefined,
         });
+        onParsed(ev.subject_id, path);
         break;
       case "error":
-        touch(path, ev.subject_id, { quality: "error", error: ev.error ?? "Parse failed" });
-        break;
-      case "embedding":
         touch(path, ev.subject_id, {
-          embed: "active", embedPagesDone: ev.pages_done ?? 0, embedTotalPages: ev.total_pages ?? 0,
+          parse: "error", error: ev.error ?? "Parse failed", errorKind: ev.kind,
+          errorRetryable: ev.retryable, errorLatching: ev.latching,
         });
         break;
-      case "embedded": {
-        // The fast-pass embed is provisional; quality's embed is final.
-        const final = usePipelineStore.getState().items[path]?.quality === "done";
-        touch(path, ev.subject_id, {
-          embed: final ? "done" : "pending", ...(final ? { embeddedAt: Date.now() } : {}),
-        });
-        break;
-      }
-      case "embed_error": {
-        const final = usePipelineStore.getState().items[path]?.quality === "done";
-        touch(path, ev.subject_id, final
-          ? { embed: "error", error: ev.error ?? "Embed failed" }
-          : { embed: "pending" });
-        break;
-      }
     }
-
-    // Index after both fast and quality commits. The latter refreshes page
-    // text even when its image vectors are unchanged.
-    if (ev.status === "fast" || ev.status === "quality") onParsed(ev.subject_id, path);
   }, (message) => {
     useParseStore.getState().update({ ...ev, status: "error", error: message });
-    usePipelineStore.getState().touch(path, ev.subject_id, { quality: "error", error: message });
+    usePipelineStore.getState().touch(path, ev.subject_id, { parse: "error", error: message });
     onError(message);
   });
 }

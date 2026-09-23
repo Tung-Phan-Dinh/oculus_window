@@ -1,4 +1,5 @@
-# Python
+# Python — the sidecar left the repo in f875bb1; these stay only so an
+# orphaned `sidecar/.venv` from an older checkout is never committed.
 __pycache__/
 *.py[cod]
 .venv/
@@ -26,3 +27,11 @@ app/src-tauri/binaries/
 .local-tools/
 artifacts/
 app/src-tauri/resources/
+
+# A local MinerU's spill. `mineru-api` writes one folder per request — markdown,
+# both content lists, every extracted image — under ./output, relative to
+# wherever it was started. It sweeps its own after 24h, but only while it keeps
+# running; anything left when it stops is orphaned. Unanchored on purpose: the
+# trap is that it lands wherever you happened to be. The real fix is
+# MINERU_API_OUTPUT_ROOT in the start line — see docs/parsing.md.
+output/

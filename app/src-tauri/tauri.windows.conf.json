@@ -15,8 +15,7 @@
   "bundle": {
     "targets": ["nsis"],
     "resources": {
-      "resources/sidecar/": "sidecar/",
-      "resources/tools/uv.exe": "tools/uv.exe"
+      "binaries/pdfium.dll": "pdfium.dll"
     },
     "windows": {
       "nsis": {

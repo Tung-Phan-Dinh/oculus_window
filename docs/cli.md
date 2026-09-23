@@ -35,13 +35,12 @@ own `--help` that there is no undo.
 `lecture` reads no upstream copy at all: it decodes a recording already on disk
 (see [chapters.md](./chapters.md)), which is why it has no cache to invalidate
 and re-running it is the whole story. `lecture candidates` writes nothing at
-all. `lecture chapters` and `lecture recap` write **derived** rows — not a
+all. `lecture chapters` and `lecture reading` write **derived** rows — not a
 copy of anything upstream and not the user's own work either, but something
 regenerable from the recording — so `--force` is the door for replacing them.
 These are also the commands that spend a model's quota, which is why each
-leaves an existing result alone unless asked. A recap additionally requires
-the transcript on disk: its notes describe what was said over a slide, not
-only what the frame shows.
+leaves an existing result alone unless asked. A reading copy additionally
+requires the transcript on disk: it *is* the transcript, rewritten.
 
 Two commands stand outside that split. `docs` documents the whole agent-facing
 surface to the agents that use it, and `agent` runs one of those agents for a
@@ -66,11 +65,12 @@ the instructions gets read without opening the window.
 
 ## How it connects
 
-- `--memory-cap <MB>` is global, so `oculus --memory-cap 8192 index` and
-  `oculus index --memory-cap 8192` are equivalent. Minimum 5120. It calls
-  the running sidecar's `/limits` before the command, requires that sidecar
-  to be available, and is not saved to the app's preferences. The budget
-  covers the whole sidecar tree; at 5 GB local quality may not fit.
+- **`--json` is the only global flag.** `--memory-cap` went with the Python
+  sidecar it bounded, and did not come back with the local parse engine. A
+  MinerU the user installed and started is not this app's child process: its
+  memory is its own to manage, and a flag here could not bound it if it tried.
+  What a parse costs is the selected engine's business — MinerU's allowance on
+  the cloud, this machine's RAM on a local server somebody else is running.
 - The CLI reads the same session cookie and writes the same `oculus.db` the
   app uses — a CLI sync shows up in the app and vice versa. But it **never
   creates the database** (schema stays with the app's migrations), so a
@@ -90,32 +90,65 @@ the instructions gets read without opening the window.
   console, and a non-zero exit only reads as a crashed job. Safe to run by
   hand when you want to know whether the agent's path still works.
 - `run -s` scrapes, then parses and embeds each written PDF **one file at a
-  time**. The sidecar serializes local heavy work but batches cloud quality
-  independently. Both halves are idempotent; re-running is cheap.
-- The sidecar returns once its *fast* pass has markdown; the quality parse
-  finishes in the background after the command exits. `oculus index` folds
-  that improved text into the database without re-downloading anything.
+  time**. Both halves are idempotent; re-running is cheap.
+- **A parse finishes before the command moves on, and that is minutes per
+  file.** It used to return as soon as the old *fast* pass had markdown
+  and leave the real parse running in another process, so the good text only
+  appeared on some later `oculus index`. Parsing is in this process now
+  (`app/src-tauri/src/parse/mod.rs`), so the wait is the whole cloud round
+  trip — the page count rewrites itself on the line as pages arrive, which is
+  how you tell a long parse from a hung one.
+- **The embed half is slower than the parse half, and on a Voyage account with
+  no payment method it is dramatically slower**: 10K tokens a minute against
+  ~3,571 tokens for a 200-DPI page is about 2.8 pages a minute, so a large deck
+  is genuinely an hour or more. It gets the same in-place counter for the same
+  reason, and no timeout is imposed on it — the client paces itself against the
+  tier it detected and a 429 is routine rather than a failure. See
+  [retrieval.md](./retrieval.md).
+- **`index` re-embeds a file whose vectors came from a retired model.** There
+  is no migration between embedding spaces and there is not meant to be:
+  `embed::is_embedded` compares model, dim and page coverage, so the files the
+  local Qwen embedder wrote read as unfinished and rebuild on the next run.
+- **`index` obeys the spend guard the app sets**, because both processes read
+  the same `voyage-usage.json`. Past the configured percentage of Voyage's free
+  pixel grant the client refuses with `BudgetReached`, which names the setting
+  rather than blaming the account — it is not a rate limit and waiting will not
+  clear it. See [retrieval.md](./retrieval.md).
+- `oculus status` reports the **parser**, not a local process: the backend
+  name, whether it is usable, and its `parser_version` — the handshake that
+  decides whether artifacts written elsewhere can be read as this app's. It
+  goes through `preflight`, so it never calls MinerU's cloud and costs no
+  metered quota. On the local engine it is not quite free: `health()` probes
+  the configured loopback address, which answers at once or times out in three
+  seconds. See [parsing.md](./parsing.md).
 - `run -s` also refreshes each subject's Canvas calendar (class times and due
   dates) into `calendar_events` after the scrape — the CLI has no sync options
   to gate it with, so it always runs. See [calendar.md](./calendar.md).
 - Subject codes match on prefix (`MULT20015` finds `MULT20015_2026_SM2`).
 - Lecture ids match on a unique prefix, as printed by `oculus list -l`.
-  `lecture recap` resolves that prefix, then runs the configured
-  `Job::LectureRecap`; `--provider`, `--model` and `--effort` override one run
-  without changing the registry. Its roughly ten-minute windows run in
+  `lecture reading` resolves that prefix, then runs the configured
+  `Job::LectureReading`; `--provider`, `--model` and `--effort` override one
+  run without changing the registry. Its roughly ten-minute windows run in
   sequence and commit independently, so an error can leave the completed
-  windows from this run visible. See [chapters.md](./chapters.md#lecture-recap).
+  windows from this run visible. See
+  [chapters.md](./chapters.md#the-reading-copy).
 
 ## The query half
 
-- **`search` needs the sidecar and says so.** The query is embedded by the
-  same Qwen3-VL model that embedded the page images — there is no text index
-  to fall back on — so semantic search only works while something is running
-  the sidecar, which in practice means the app is open. When it is down the
-  command **fails with exit 1 and names `oculus grep`** rather than returning
-  zero hits. That is deliberate: a caller handed an empty result concludes
-  the library has no answer and stops; a caller told why it is empty tries
-  the other door. An empty index fails the same way, naming `oculus index`.
+- **`search` fails loudly rather than returning zero hits.** The query is
+  embedded by the same cloud model that embedded the page images — there is no
+  text index to fall back on — so it needs a Voyage key in the keychain and a
+  network. An empty index **fails with exit 1 and names `oculus index`**. That
+  is deliberate: a caller handed an empty result concludes the library has no
+  answer and stops; a caller told why it is empty tries the other door, which
+  is `oculus grep`.
+- **"Indexed" and "searchable" are different numbers, and `search` says which
+  one is zero.** Only vectors from the model that embedded the query are
+  scanned, because a dot product across two embedding spaces is meaningless and
+  still sorts. A library full of vectors from a retired model therefore fails
+  with a message naming that model and `oculus index`, not with "nothing is
+  indexed". `oculus status` prints the same split: an `index` line for what can
+  be searched now and a `stale` line for what needs re-embedding.
 - `search` takes a *set* of subject ids, not one — a prefix code legitimately
   matches the same subject in two terms. `retrieval::search_in` is the
   multi-subject entry point; `retrieval::search` is the one-subject wrapper
@@ -125,7 +158,23 @@ the instructions gets read without opening the window.
   PDF page text is only in the `pages` table. A caller reaching for ripgrep
   over `courses/` silently misses every slide deck. `grep` scans in subject
   then path order and stops at its limit, so the two sources interleave
-  instead of the database half crowding out the disk half.
+  instead of the database half crowding out the disk half. That ordering is
+  also why it takes `-c`: a truncated result is biased rather than sampled,
+  and narrowing to a category cuts the haystack *before* the limit applies.
+- **`-c/--category` is one filter behind two commands.** `grep` and `files`
+  share `filter_categories`, so the flag spelled the same way on sibling
+  commands cannot disagree about what it accepts, and the help both print is
+  built from the list it validates against. That list is
+  `paths::CATEGORIES`, beside the `category_from_path` that produces the
+  values, with a test tying the two together — a validator holding its own
+  copy goes stale the first time a scraper grows a folder.
+  A word that is **not** a category is refused, naming the real ones, for the
+  same reason an unknown board column is: an empty result from a typo reads
+  exactly like an empty library. A real category the selected subjects happen
+  not to have is a well-formed question and returns no matches — which is why
+  validity is the canonical list and not the categories the matched rows
+  carry. Reading it off the rows conflates the two and refuses
+  `-s INFO30006 -c quiz` for a subject that simply has no quizzes.
 - `read` addresses PDFs by the **same page numbers** `search` reports and the
   app's viewer shows, because all three read `pages.markdown` keyed on
   `(file_id, page_no)`. For an Office document that means the derived sibling
@@ -138,17 +187,40 @@ the instructions gets read without opening the window.
   document on stdout, and on failure `{"error": "..."}` on **stderr** with
   exit 1. `status --json` carries the index stats too, so a caller can find
   out whether `search` will work before trying it.
-- These commands never start the sidecar and never scrape. A read command on
-  a machine where the app has never run reports what is missing and stops.
+- These commands never scrape and start nothing. A read command on a machine
+  where the app has never run
+  reports what is missing and stops. `search` is the one exception to "reads
+  cost nothing": it embeds one query, which spends a few tokens of the Voyage
+  allowance.
 
 ## The planning half
 
 - **`project` and `task` are the agent's write surface**, and the database is
   the only door: the app's board reads these same rows live, which is why
-  nothing here asks for `oculus.db` to be opened directly. Nine subcommands —
-  `project list|show|create|update` and `task list|add|update|move|rm` —
-  all honouring `--json`. The rules they enforce, and why, are in
+  nothing here asks for `oculus.db` to be opened directly. Ten subcommands —
+  `project list|show|create|update` and `task list|add|update|move|refile|rm`
+  — all honouring `--json`. The rules they enforce, and why, are in
   [projects.md](./projects.md); what is CLI-shaped about them is below.
+- **A task does not need a project.** `oculus task add` with no `-p` writes an
+  **unfiled** task — one that belongs to no project at all, which is the
+  absence of a project rather than a project called Inbox
+  ([projects.md](./projects.md)). It is the CLI's half of what the app's Tasks
+  page does by default, and it exists because "write this down, I have not
+  decided where it goes" is most of what gets said to an agent mid-conversation;
+  demanding a project id first turns a note into a planning session. Its board
+  is the app's default one, so filing it somewhere later needs no translation.
+- **`oculus task list` with no `-p` spans the library** — one board per
+  project under its name, the unfiled pile first, and `--unfiled` for that pile
+  alone. `--column` still requires `-p`: a column id only means something
+  against one board, so there is nothing across projects for it to filter.
+- **`oculus task refile` is the only thing that changes which project a task
+  is on**, and it takes the task's **subtasks with it** — a subtask sits in its
+  parent's project, so a lone subtask is refused and told to refile its parent.
+  The column maps across by *kind*, into the first column of that kind on the
+  destination's board, and a destination with no column of that kind is refused
+  rather than given the nearest one. It appends at the end of that column,
+  because `position` is an order inside one project's column and means nothing
+  across two; `task move` is how it is then placed.
 - **A breakdown goes in as one `--batch`, not a command per task.** `oculus
   task add -p <ID> --batch -` reads a JSON array from stdin (or a file) and
   writes it in a single transaction, so a rejected item rolls the whole thing
@@ -191,11 +263,31 @@ see the bullet on scaffolding in [sync.md](./sync.md).
   OCULUS.md       stub
   TASTE.md        stub — standing preferences
   memories/       cross-subject; MEMORY.md index stubbed beside them
+  memories/<code>/  one subject's, with its own MEMORY.md index
+  skills/<name>/SKILL.md    one procedure, generated
+  .claude/skills/<name> → ../../skills/<name>
+  .agents/skills/<name>  → ../../skills/<name>
 <data>/courses/<code>/
   AGENTS.md → ../../agents/AGENTS.md
-  agents/memories/    subject-scoped, with its own MEMORY.md index;
-                      INSTRUCTIONS.md goes here too
+  agents/INSTRUCTIONS.md    hand-written, for this subject alone
+  agents/memories → ../../../agents/memories/<code>
 ```
+
+**The skills are one directory reached three ways**, because the three CLIs
+disagree about where a skill lives. Two of the three disagree the same way:
+Claude Code scans `<cwd>/.claude/skills` and Codex scans
+`<cwd>/.agents/skills`, both walking up from the working directory, so both
+get a relative link beside the one copy. opencode takes a `skills.paths` key
+in its config and is linked for not at all. Every path is inside the library —
+nothing here writes to a home directory. See [harness.md](./harness.md).
+
+**Both memory buckets live under `agents/`, and that is containment rather
+than filing.** `agents/` is the only folder an in-app chat thread can write to
+(see [harness.md](./harness.md)), so a subject bucket in the course folder was
+a path every template named and no thread could use. The course folder keeps a
+symlink to it, and `agents.rs` moves any files it finds on the old path into
+the bucket the first time it runs — once, since what it leaves behind is a
+link.
 
 Three different lifetimes, which is the whole design:
 
@@ -204,7 +296,11 @@ Three different lifetimes, which is the whole design:
   exists and a test asserts the coverage. Nothing is hand-written, because an
   agent trusts a file over `--help` — a stale reference is worse than none.
   `AGENTS.md` is overwritten too: it is one universal file, which is what
-  removes any per-course copy to keep in sync.
+  removes any per-course copy to keep in sync. So are the `skills/`, for a
+  sharper version of the same reason: a skill is read as a procedure rather
+  than as background, so one naming a flag this binary no longer has is
+  followed instead of weighed. There is exactly one copy of each and every
+  run rewrites it.
 - **Stubbed once, then the user's.** `OCULUS.md`, `TASTE.md` and the
   `MEMORY.md` index in each memory folder are written only when absent. They are the one thing in `agents/` a human authors, and
   overwriting them would be the only unrecoverable thing this command could
@@ -213,33 +309,39 @@ Three different lifetimes, which is the whole design:
   universal.
 - **Linked, never clobbered.** The course-folder `AGENTS.md` is a *relative*
   symlink, so the library stays movable. A wrong target is relinked; a real
-  file is left alone with a warning, because it is somebody's work.
+  file is left alone with a warning, because it is somebody's work. The two
+  skill links follow the same rule — Claude's relative, Codex's absolute
+  because its home is a different tree — so a student's own `oculus-plan` in
+  `~/.codex/skills` survives a sync.
 
 Details worth not rediscovering:
 
 - Rendering is pinned to 88 columns with colour off, so the output depends on
   the binary and not the terminal that ran it. Wrapping needs clap's
   `wrap_help` feature, which is why it is enabled in `Cargo.toml`.
-- Global `--json` and `--memory-cap` are hidden below the root: clap would
-  otherwise repeat their full text under all sixteen subcommands, which was a
-  third of the file.
+- Global `--json` is hidden below the root: clap would otherwise repeat its
+  full text under all sixteen subcommands, which was a third of the file.
 - At ~12 KB `OCULUS-CLI.md` is a *pull* document. `AGENTS.md` says when to
   open it rather than pasting it into every context — the same reason
   `AGENTS.md` itself stays short.
 - `bun run cli:install` runs `oculus docs`, so the reference always describes
   the binary actually on `PATH`. `bun run cli` deletes the old binary first:
   cargo will otherwise report success while leaving a stale one in place,
-  which would document the wrong build.
+  which would document the wrong build. `bun run cli:dev` is the same build in
+  the debug profile — the one the dev app's agents actually run, see
+  [development.md](./development.md#the-dev-cli).
 - The same rendering also lands in the repo as
   [cli-reference.md](./cli-reference.md), written by
   `app/scripts/gen-cli-docs.mjs` from `oculus docs --stdout`. It runs from
   `beforeBuildCommand`, straight after `stage-cli` has built the release
   binary — the one moment in the toolchain where a current binary is
   guaranteed to exist, so a bundle cannot ship a CLI its reference does not
-  describe. It is deliberately *not* on `beforeDevCommand`: `tauri dev` never
-  builds the CLI, so hooking it there would add a release build to every dev
-  start. Run `bun run docs:cli` by hand after changing the CLI if you want the
-  repo copy current before a bundle.
+  describe. It also runs from the dev preflight
+  (`app/scripts/predev.mjs`), against the debug binary that preflight has just
+  built: that used to be impossible because `tauri dev` never built the CLI at
+  all, and it is one process launch now that it does. Either way the generator
+  rewrites the file only when the help actually changed, so a clean tree stays
+  clean and a changed CLI is dirty in the same commit as its reference.
 - Why the repo needs a copy at all: `OCULUS-CLI.md` only exists on a machine
   where the CLI has been installed. The repo copy is for a reader — or an
   agent working on Oculus rather than on a library — with no built binary.

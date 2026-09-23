@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use app_lib::agents;
+use app_lib::paths;
 use app_lib::projects;
 use app_lib::store;
 use app_lib::sync::{self, Engine, FileEvent, Progress, Reporter};
@@ -25,9 +26,6 @@ use tokio::runtime::Runtime;
     about = "Sync Canvas subjects and lectures into your local Oculus library"
 )]
 struct Cli {
-    /// Whole sidecar process-tree memory cap in MB (minimum 5120)
-    #[arg(long, global = true, value_parser = clap::value_parser!(u64).range(5120..))]
-    memory_cap: Option<u64>,
     /// Print machine-readable JSON instead of formatted text
     ///
     /// Honoured by every command that prints: status, list, search, grep,
@@ -42,19 +40,6 @@ struct Cli {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
-
-    #[test]
-    fn memory_cap_is_global_and_has_a_floor() {
-        for arguments in [
-            vec!["oculus", "--memory-cap", "8192", "index"],
-            vec!["oculus", "index", "--memory-cap", "5120"],
-        ] {
-            let cli = Cli::try_parse_from(arguments).expect("global memory cap");
-            assert!(cli.memory_cap.unwrap() >= 5120);
-            assert!(matches!(cli.command, Some(Command::Index(_))));
-        }
-        assert!(Cli::try_parse_from(["oculus", "--memory-cap", "4096"]).is_err());
-    }
 
     #[test]
     fn broker_subject_queries_never_refresh_the_library() {
@@ -117,26 +102,28 @@ mod cli_tests {
         }
         assert!(markdown.contains("### `oculus auth login`"), "nested commands");
         assert!(
-            markdown.contains("### `oculus lecture recap`"),
-            "lecture recap command"
+            markdown.contains("### `oculus lecture reading`"),
+            "lecture reading command"
         );
         assert!(!markdown.contains('\u{1b}'), "no ANSI escapes in a file");
     }
 
-    /// Global options are worth one paragraph, not fifteen.
+    /// Global options are worth one paragraph, not fifteen. `--json` is the
+    /// only one left now that `--memory-cap` has gone with the sidecar, so it
+    /// carries the rule on its own: a global flag repeated under every
+    /// subcommand would fail this.
     #[test]
     fn generated_docs_list_global_options_once() {
         let markdown = render_cli_docs();
-        assert_eq!(markdown.matches("--memory-cap <MEMORY_CAP>").count(), 1);
         assert_eq!(markdown.matches("      --json").count(), 1);
     }
 
     #[test]
-    fn lecture_recap_accepts_one_run_overrides() {
+    fn lecture_reading_accepts_one_run_overrides() {
         let cli = Cli::try_parse_from([
             "oculus",
             "lecture",
-            "recap",
+            "reading",
             "a1b2c3d4",
             "--force",
             "--provider",
@@ -146,12 +133,12 @@ mod cli_tests {
             "--effort",
             "medium",
         ])
-        .expect("recap flags");
+        .expect("reading flags");
         let Some(Command::Lecture {
-            action: LectureAction::Recap(args),
+            action: LectureAction::Reading(args),
         }) = cli.command
         else {
-            panic!("lecture recap command");
+            panic!("lecture reading command");
         };
         assert_eq!(args.id, "a1b2c3d4");
         assert_eq!(args.provider.as_deref(), Some("codex"));
@@ -163,7 +150,7 @@ mod cli_tests {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Session, library and sidecar status
+    /// Session, library and parse status
     Status,
     /// Sign in to Canvas, or sign out
     Auth {
@@ -189,7 +176,7 @@ enum Command {
         #[command(subcommand)]
         action: ProjectAction,
     },
-    /// Add, move, finish and delete the tasks on a project's board
+    /// Add, move, refile, finish and delete tasks, on a board or on none
     Task {
         #[command(subcommand)]
         action: TaskAction,
@@ -205,12 +192,13 @@ enum Command {
 
 #[derive(Args)]
 #[command(
-    about = "Run one prompt through a CLI agent (Claude Code or Codex)",
+    about = "Run one prompt through a CLI agent (Claude Code, Codex, opencode or Antigravity)",
     long_about = "Run one prompt through a CLI agent and print what it does.\n\n\
 The same bridges the app's chat uses, without the window: the agent runs from \
 the library's agents/ folder with the app's instructions appended, can read the \
 whole library and write only there, and its normalized events are printed as they \
-arrive. Needs the provider's CLI installed and signed in (`claude` or `codex`). \
+arrive. Needs the provider's CLI installed and signed in (`claude`, `codex`, `opencode` or \
+`agy`). \
 Nothing is recorded in the database; this is for checking a bridge works."
 )]
 struct AgentArgs {
@@ -218,7 +206,7 @@ struct AgentArgs {
     #[arg(value_name = "PROMPT")]
     prompt: String,
     /// Which CLI to drive
-    #[arg(short, long, value_parser = ["claude", "codex"])]
+    #[arg(short, long, value_parser = ["claude", "codex", "opencode", "antigravity"])]
     #[cfg_attr(windows, arg(default_value = "codex"))]
     #[cfg_attr(not(windows), arg(default_value = "claude"))]
     provider: String,
@@ -323,7 +311,7 @@ struct RunArgs {
     /// Include subjects from past terms, not just the current one
     #[arg(long)]
     all: bool,
-    /// Skip the sidecar entirely: no PDF parsing and no embedding
+    /// Skip PDF processing entirely: no parsing and no embedding
     #[arg(long)]
     no_parse: bool,
     /// Parse PDFs but do not embed them into the retrieval index
@@ -351,13 +339,15 @@ struct RunArgs {
 // has never seen this binary, so it says what each command needs and what it
 // costs, not just what it does.
 
-/// Search the library by meaning (needs the sidecar).
+/// Search the library by meaning (needs network and an API key).
 ///
 /// The query is embedded by the same vision model that embedded every page
 /// image, so this finds a slide about Lagrange multipliers when you ask for
-/// "constrained optimisation". It needs the sidecar running (open the Oculus
-/// app); when it is not, this fails loudly and points at `oculus grep`, which
-/// searches the same text with no model.
+/// "constrained optimisation". Embedding happens in the cloud, so this needs
+/// a network connection and the Voyage key from Settings → Library; without
+/// either, and over an index that is empty or built by a retired model, it
+/// fails loudly and points at `oculus grep`, which searches the same text
+/// with no model at all.
 ///
 /// Only PDF and Office pages are ranked here — Canvas pages, announcements
 /// and Ed threads are markdown on disk and are covered by `oculus grep`.
@@ -377,16 +367,16 @@ struct SearchArgs {
     full: bool,
 }
 
-/// Search the library by pattern (no sidecar needed).
+/// Search the library by pattern (offline, no model).
 ///
 /// Covers both halves of the library: the markdown on disk (Canvas pages,
 /// announcements, assignments, Ed threads) and the page text extracted from
 /// PDFs, which lives only in the database — ripgrep over the library
 /// directory cannot see it, which is why this exists.
 ///
-/// Needs no sidecar and no model, so it is the fallback whenever `oculus
-/// search` reports the sidecar is down. The pattern is a regular expression
-/// by default and case-insensitive unless you ask otherwise.
+/// Needs no network and no model, so it is the fallback whenever `oculus
+/// search` cannot run. The pattern is a regular expression by default and
+/// case-insensitive unless you ask otherwise.
 #[derive(Args)]
 struct GrepArgs {
     /// Regular expression to look for
@@ -395,6 +385,8 @@ struct GrepArgs {
     /// Restrict to these subjects; prefix codes are fine. Repeatable.
     #[arg(short = 's', long, value_name = "SUBJECT_CODE")]
     subject: Vec<String>,
+    #[arg(short = 'c', long, value_name = "CATEGORY", help = category_help())]
+    category: Vec<String>,
     /// Treat the pattern as literal text, not a regular expression
     #[arg(short = 'F', long)]
     fixed: bool,
@@ -445,10 +437,8 @@ struct FilesArgs {
     /// Only this extension (pdf, md, pptx, docx, png …)
     #[arg(short = 't', long, value_name = "EXT")]
     r#type: Option<String>,
-    /// Only this Canvas category (file, page, announcement, ed, module,
-    /// assignment, quiz, syllabus, home, image)
-    #[arg(short = 'c', long, value_name = "CATEGORY")]
-    category: Option<String>,
+    #[arg(short = 'c', long, value_name = "CATEGORY", help = category_help())]
+    category: Vec<String>,
     /// Only paths containing this text (case-insensitive)
     #[arg(short = 'm', long, value_name = "TEXT")]
     r#match: Option<String>,
@@ -600,20 +590,30 @@ enum TaskAction {
     Add(TaskAddArgs),
     Update(TaskUpdateArgs),
     Move(TaskMoveArgs),
+    Refile(TaskRefileArgs),
     Rm(TaskRmArgs),
 }
 
-/// List a project's tasks.
+/// List tasks — one project's, or every task there is.
 ///
 /// Grouped by column in the board's order, subtasks under their parent. A task
 /// sitting in a `done` column carries the time it landed there.
+///
+/// Without `-p` this spans **every** project and includes the tasks that
+/// belong to none, printed as one board per project under its name, with the
+/// unfiled ones first. `--unfiled` lists only those: the pile with no board of
+/// its own, which is the one that needs looking at.
 #[derive(Args)]
 struct TaskListArgs {
-    /// Which project
+    /// Which project (omit for every task in the library)
     #[arg(short = 'p', long, value_name = "ID")]
-    project: i64,
-    /// Only this board column (its id, e.g. todo)
-    #[arg(short = 'c', long, value_name = "ID")]
+    project: Option<i64>,
+    /// Only tasks that belong to no project at all
+    #[arg(long, conflicts_with = "project")]
+    unfiled: bool,
+    /// Only this board column (its id, e.g. todo) — needs --project, since a
+    /// column id only means something against one board
+    #[arg(short = 'c', long, value_name = "ID", requires = "project")]
     column: Option<String>,
     /// Only tasks due before this ISO 8601 timestamp. Compared as text, so
     /// pass the same shape the dates were written in (UTC, usually).
@@ -623,12 +623,19 @@ struct TaskListArgs {
 
 /// Add one task, or a whole breakdown in one call.
 ///
-/// A task lands at the end of its column; without `--column` that is the
-/// project's first one. The column id is checked against the project's board
-/// and an unknown one is refused, listing the ids the board does have — a task
-/// filed under a column that does not exist is drawn by nothing, in any view.
-/// Landing in a `done` column marks the task finished, exactly as moving it
-/// there would.
+/// **Without `-p` the task belongs to no project at all** — the same thing the
+/// app's Tasks page writes by default, and the answer to "write this down, I
+/// have not decided where it goes". That is the absence of a project, not a
+/// project called Inbox, so nothing needs cleaning up if it is never filed;
+/// `oculus task refile` files it later. Its board is the default one
+/// (`backlog`, `todo`, `doing`, `done`), so filing it into a project created by
+/// this binary needs no translation.
+///
+/// A task lands at the end of its column; without `--column` that is the first
+/// column of its board. The column id is checked against that board and an
+/// unknown one is refused, listing the ids it does have — a task filed under a
+/// column that does not exist is drawn by nothing, in any view. Landing in a
+/// `done` column marks the task finished, exactly as moving it there would.
 ///
 /// `--parent` makes the task a subtask. Subtasks are one level deep: a subtask
 /// cannot itself be given children.
@@ -654,13 +661,13 @@ struct TaskListArgs {
 /// Prints the new task ids in the order they were given.
 #[derive(Args)]
 struct TaskAddArgs {
-    /// Which project
+    /// Which project (omit to file it nowhere)
     #[arg(short = 'p', long, value_name = "ID")]
-    project: i64,
+    project: Option<i64>,
     /// The task's title. Omit when using --batch.
     #[arg(value_name = "TITLE")]
     title: Option<String>,
-    /// Board column id (default: the project's first column)
+    /// Board column id (default: the first column of its board)
     #[arg(short = 'c', long, value_name = "ID")]
     column: Option<String>,
     /// Make this a subtask of that task id
@@ -738,6 +745,36 @@ struct TaskMoveArgs {
     before: Option<i64>,
 }
 
+/// File a task under another project, or under none at all.
+///
+/// The one command that changes which project a task belongs to. It takes the
+/// task's **subtasks with it** — a subtask sits in its parent's project, so
+/// there is no honest half of this move, and a subtask on its own is refused
+/// and names its parent instead.
+///
+/// The column maps across by *kind*: a task in a column that means "in flight"
+/// lands in the **first** column of that kind on the destination's board, so
+/// entering a kind puts you at its start. A board with no column of that kind —
+/// no Done column for a finished task — is refused rather than given the
+/// nearest one; there is no nearest kind. Whether the task is finished follows
+/// the column it lands in, as it does everywhere else.
+///
+/// It lands at the **end** of that column: `position` is an order inside one
+/// project's column and means nothing across two, so there is no slot in the
+/// destination to aim at. `oculus task move` is how it is then placed.
+#[derive(Args)]
+struct TaskRefileArgs {
+    /// Task id
+    #[arg(value_name = "ID")]
+    id: i64,
+    /// File it under this project
+    #[arg(short = 'p', long, value_name = "ID")]
+    project: Option<i64>,
+    /// Take it out of every project instead
+    #[arg(long, conflicts_with = "project")]
+    unfiled: bool,
+}
+
 /// Delete a task, and its subtasks with it.
 ///
 /// There is no undo, and nothing else cleans these up — a task that is merely
@@ -758,7 +795,7 @@ struct TaskRmArgs {
 enum LectureAction {
     Candidates(LectureCandidatesArgs),
     Chapters(LectureChaptersArgs),
-    Recap(LectureRecapArgs),
+    Reading(LectureReadingArgs),
 }
 
 /// Find where a recording plausibly changes topic
@@ -781,6 +818,10 @@ struct LectureCandidatesArgs {
     /// so the boundaries can be checked by eye
     #[arg(long)]
     frames: bool,
+    /// Which captured stream to read — 1 or 2. Default: source 1, unless it
+    /// turns out to be dead, in which case source 2 if it is downloaded
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=2))]
+    source: Option<u8>,
 }
 
 /// Name a recording's chapters with a CLI agent, and store them
@@ -804,7 +845,7 @@ struct LectureChaptersArgs {
     // registry (`app/src-tauri/src/harness/jobs.rs`), so the app and the CLI
     // run the same thing. A flag overrides that selection for one run.
     /// Which CLI to drive (default: the configured one)
-    #[arg(short, long, value_parser = ["claude", "codex"])]
+    #[arg(short, long, value_parser = ["claude", "codex", "opencode"])]
     provider: Option<String>,
     /// Model to request (default: the configured one)
     #[arg(short, long)]
@@ -816,21 +857,27 @@ struct LectureChaptersArgs {
     /// Re-run over a lecture that already has chapters, replacing them
     #[arg(long)]
     force: bool,
+    /// Which captured stream to read — 1 or 2. Default: source 1, unless it
+    /// turns out to be dead, in which case source 2 if it is downloaded
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=2))]
+    source: Option<u8>,
 }
 
-/// Write a slide-by-slide recap of a recording with a CLI agent
+/// Write a recording's reading copy with a CLI agent
 ///
-/// Splits the lecture at its visual changes, groups those segments into
-/// roughly ten-minute windows, and asks a coding agent to describe what the
-/// slide shows and what the lecturer says over it. Each window is validated
-/// and written before the next starts, so a long run has useful partial
-/// results if a later window fails.
+/// Rewrites the transcript as text a student can read: one sentence per
+/// line, each pinned to the second it was said, with spoken maths set as
+/// maths and speech-recognition errors fixed from the slide. The lecture is
+/// split at its slide changes — which become paragraph breaks — and grouped
+/// into roughly ten-minute windows, one agent turn each. Each window is
+/// validated and written before the next starts, so a long run has useful
+/// partial results if a later window fails.
 ///
-/// Unlike chapter naming, this needs the transcript: a recap is about the
-/// explanation as well as the slide. The recording and transcript must both
-/// have been downloaded first.
+/// Unlike chapter naming, this needs the transcript: the reading copy is the
+/// transcript, rewritten. The recording and transcript must both have been
+/// downloaded first.
 #[derive(Args)]
-struct LectureRecapArgs {
+struct LectureReadingArgs {
     /// Lecture id, as `oculus list -l` prints it; a unique prefix is enough
     #[arg(value_name = "LECTURE_ID")]
     id: String,
@@ -838,7 +885,7 @@ struct LectureRecapArgs {
     // replaces only the named part for this run, exactly as chapter naming
     // does above.
     /// Which CLI to drive (default: the configured one)
-    #[arg(short, long, value_parser = ["claude", "codex"])]
+    #[arg(short, long, value_parser = ["claude", "codex", "opencode"])]
     provider: Option<String>,
     /// Model to request (default: the configured one)
     #[arg(short, long)]
@@ -847,9 +894,13 @@ struct LectureRecapArgs {
     /// configured one)
     #[arg(long)]
     effort: Option<String>,
-    /// Re-run over a lecture that already has recap notes, replacing them
+    /// Re-run over a lecture that already has a reading copy, replacing it
     #[arg(long)]
     force: bool,
+    /// Which captured stream to read — 1 or 2. Default: source 1, unless it
+    /// turns out to be dead, in which case source 2 if it is downloaded
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=2))]
+    source: Option<u8>,
 }
 
 /// Write the agent-facing docs into the library
@@ -873,13 +924,6 @@ fn main() {
     restore_sigpipe();
     let cli = Cli::parse();
     let ctx = Ctx::new(cli.json);
-
-    if let Some(cap) = cli.memory_cap {
-        if let Err(error) = app_lib::sidecar::set_limits(Some(cap), None) {
-            eprintln!("{} {error}", paint("error:", RED));
-            std::process::exit(1);
-        }
-    }
 
     let result = match cli.command {
         None | Some(Command::Status) => ctx.status(),
@@ -916,12 +960,13 @@ fn main() {
             TaskAction::Add(a) => ctx.task_add(&a),
             TaskAction::Update(a) => ctx.task_update(&a),
             TaskAction::Move(a) => ctx.task_move(&a),
+            TaskAction::Refile(a) => ctx.task_refile(&a),
             TaskAction::Rm(a) => ctx.task_rm(&a),
         },
         Some(Command::Lecture { action }) => match action {
             LectureAction::Candidates(a) => ctx.lecture_candidates(&a),
             LectureAction::Chapters(a) => ctx.lecture_chapters(&a),
-            LectureAction::Recap(a) => ctx.lecture_recap(&a),
+            LectureAction::Reading(a) => ctx.lecture_reading(&a),
         },
         Some(Command::Docs(args)) => ctx.docs(&args),
         Some(Command::Agent(args)) => ctx.agent(&args),
@@ -1020,11 +1065,18 @@ impl Ctx {
             /// caller deciding what to do about it.
             detail: Option<String>,
         }
+        /// What the configured parse backend says about itself. There is no
+        /// process to report on any more — parsing happens in this one — so
+        /// this is the seam's own `Health`, plus why it could not be reached
+        /// when it could not be. `parser_version` stays visible because it is
+        /// the version handshake: a backend stamping a different number writes
+        /// artifacts this binary cannot read as its own.
         #[derive(Serialize)]
-        struct Sidecar {
-            running: bool,
-            pid: Option<i64>,
-            parser_version: Option<i64>,
+        struct ParserStatus {
+            backend: String,
+            ready: bool,
+            parser_version: Option<u32>,
+            detail: Option<String>,
         }
         #[derive(Serialize)]
         struct Counts {
@@ -1070,24 +1122,32 @@ impl Ctx {
             }
         };
 
-        // Report the pid: a sidecar that outlived its app answers /health
-        // perfectly while serving stale code, and this is the only way to see
-        // that from outside.
-        let health: Option<serde_json::Value> = ureq::get(&format!(
-            "http://127.0.0.1:{}/health",
-            app_lib::sidecar::SIDECAR_PORT
-        ))
-        .timeout(std::time::Duration::from_millis(500))
-        .call()
-        .ok()
-        // ureq's json helpers are behind a feature this crate does not enable.
-        .and_then(|r| r.into_string().ok())
-        .and_then(|s| serde_json::from_str(&s).ok());
-
-        let sidecar = Sidecar {
-            running: health.is_some(),
-            pid: health.as_ref().and_then(|h| h["pid"].as_i64()),
-            parser_version: health.as_ref().and_then(|h| h["parser_version"].as_i64()),
+        // Constructing the backend reads the settings row and the keychain, and
+        // `preflight` asks it about itself. On the cloud engine that is purely
+        // local and costs no quota. On the local engine `health()` probes the
+        // server over loopback — still no cloud call and still no quota, but a
+        // connect, which is why that probe carries a short timeout of its own.
+        let parser = match app_lib::parse::backend() {
+            Ok(backend) => match app_lib::parse::preflight(backend.as_ref()) {
+                Ok(health) => ParserStatus {
+                    backend: health.backend,
+                    ready: health.ready,
+                    parser_version: Some(health.parser_version),
+                    detail: None,
+                },
+                Err(e) => ParserStatus {
+                    backend: backend.health().backend,
+                    ready: false,
+                    parser_version: Some(backend.health().parser_version),
+                    detail: Some(e.to_string()),
+                },
+            },
+            Err(e) => ParserStatus {
+                backend: app_lib::parse::parse_config().engine.as_str().to_string(),
+                ready: false,
+                parser_version: None,
+                detail: Some(e.to_string()),
+            },
         };
 
         let pool = self.db();
@@ -1104,7 +1164,7 @@ impl Ctx {
                     .await
                     .unwrap_or(0);
                 let parsed: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM files WHERE parse_status IN ('fast','quality')",
+                    "SELECT COUNT(*) FROM files WHERE parse_status = 'quality'",
                 )
                 .fetch_one(pool)
                 .await
@@ -1128,7 +1188,7 @@ impl Ctx {
                 data_dir: String,
                 canvas: &'a Service,
                 ed: &'a Service,
-                sidecar: &'a Sidecar,
+                parser: &'a ParserStatus,
                 subjects: &'a Option<Counts>,
                 files: &'a Option<FileCounts>,
                 index: &'a Option<app_lib::retrieval::IndexStats>,
@@ -1137,7 +1197,7 @@ impl Ctx {
                 data_dir: self.data_dir.display().to_string(),
                 canvas: &canvas_status,
                 ed: &ed_status,
-                sidecar: &sidecar,
+                parser: &parser,
                 subjects: &subjects,
                 files: &files,
                 index: &index,
@@ -1148,18 +1208,12 @@ impl Ctx {
         println!("{}   {}", paint("canvas", DIM), describe(&canvas_status));
         println!("{}       {}", paint("ed", DIM), describe(&ed_status));
         println!(
-            "{}  {}",
-            paint("sidecar", DIM),
-            match sidecar.running {
-                true => paint(
-                    &format!(
-                        "running (pid {}, parser v{})",
-                        sidecar.pid.unwrap_or(0),
-                        sidecar.parser_version.unwrap_or(1)
-                    ),
-                    GREEN
-                ),
-                false => paint("not running — PDFs will not be parsed", YELLOW),
+            "{}   {}",
+            paint("parser", DIM),
+            match (&parser.detail, parser.parser_version) {
+                (None, Some(v)) => paint(&format!("{} (v{v})", parser.backend), GREEN),
+                (Some(why), _) => paint(why, YELLOW),
+                (None, None) => paint("unknown", DIM),
             }
         );
         if let Some(c) = &subjects {
@@ -1185,6 +1239,20 @@ impl Ctx {
                     None => String::new(),
                 }
             );
+            // Stored but not searchable. Printed as its own line rather than
+            // folded into the count above, because a caller deciding whether
+            // `oculus search` can answer needs the searchable number plain.
+            if i.pages_stale > 0 {
+                println!(
+                    "{}    {} page(s) need re-embedding{}",
+                    paint("stale", DIM),
+                    i.pages_stale,
+                    match i.stale_models.is_empty() {
+                        true => String::new(),
+                        false => paint(&format!("  from {}", i.stale_models.join(", ")), DIM),
+                    }
+                );
+            }
         }
         Ok(())
     }
@@ -1647,8 +1715,8 @@ impl Ctx {
     fn run_subjects(&self, args: &RunArgs) -> Result<(), String> {
         // No in-scrape parse triggering here: `index_pdfs` below is the CLI's
         // parse tier and it walks the same files serially. With both on, every
-        // PDF was handed to the sidecar twice — once by the engine's queue as
-        // it landed, once by `index_pdfs` — and the two could be mid-parse on
+        // PDF was submitted twice — once by the engine's queue as it landed,
+        // once by `index_pdfs` — and the two could be mid-parse on
         // the same `.md`/`.pages.json` at the same time. The app keeps the
         // in-scrape trigger; it has a UI that wants progress as files arrive.
         let engine = self.engine(false);
@@ -1720,7 +1788,7 @@ impl Ctx {
         let sink = reporter.sink();
         // The engine's fire-and-forget parse is for the app, which wants a
         // progress bar moving while it downloads. Here the index phase below
-        // owns the sidecar, one PDF at a time, so the two never overlap.
+        // owns the parsing, one PDF at a time, so the two never overlap.
         let engine = Engine::new(&self.data_dir, Box::new(reporter)).with_pdf_parsing(false);
 
         let started = std::time::Instant::now();
@@ -1780,22 +1848,32 @@ impl Ctx {
 
     /// Parse each PDF and fold it into the retrieval index.
     ///
-    /// Serial by design: the sidecar has one shared heavy-work slot, so
-    /// concurrent requests would queue there anyway — and one at a time is the
-    /// only way the log stays readable. Both halves are idempotent, so
-    /// re-running this over an already-indexed library is cheap.
+    /// Serial by design: one at a time is the only way the log stays readable,
+    /// and both halves are idempotent, so re-running this over an
+    /// already-indexed library is cheap.
+    ///
+    /// **Each file now blocks for its whole cloud round trip — minutes, not
+    /// the seconds the sidecar's fast pass answered in.** That is the point
+    /// rather than a cost: this call used to return as soon as *some* markdown
+    /// existed and leave the real parse running in another process, so the
+    /// text only appeared on some later `oculus index`. It finishes the parse
+    /// now. The per-page callback below is what keeps the terminal from
+    /// looking hung while it does.
+    ///
+    /// **The embed half is slower still, and on the free programme it is the
+    /// governor.** Voyage allows 3 requests and 10K tokens a minute to an
+    /// account with no payment method, which at ~3,571 tokens for a 200-DPI
+    /// page is about 2.8 pages a minute however well they are batched — hours
+    /// for a large deck, against a couple of minutes on tier 1. No timeout is
+    /// imposed from here: the client paces itself against the tier it
+    /// detected, a 429 is routine rather than a failure, and a deadline
+    /// invented at this level could only abandon work that was still
+    /// progressing. What this level owes the user instead is an honest
+    /// counter, which is the second callback below.
     fn index_pdfs(&self, pool: &SqlitePool, pdfs: &[(i64, String)], embed: bool) -> Result<(), String> {
         if pdfs.is_empty() {
             return Ok(());
         }
-        if !sidecar_healthy() {
-            println!(
-                "{}",
-                paint("sidecar not running — PDFs left unparsed and unindexed", YELLOW)
-            );
-            return Ok(());
-        }
-
         println!();
         println!(
             "{} {} PDF(s)",
@@ -1821,42 +1899,81 @@ impl Ctx {
                 continue;
             }
             let name = rel.rsplit('/').next().unwrap_or(rel);
-            print!("  {:<52} ", truncate(name, 52));
+            let label = format!("  {:<52} ", truncate(name, 52));
+            print!("{label}");
             let _ = std::io::stdout().flush();
 
-            let code = rel.split('/').nth(1).unwrap_or("");
-            match app_lib::sync::parse_pdf(&self.data_dir, rel, *subject_id, code, 0) {
-                Ok(mode) => print!("{}", paint(&format!("{mode:<6}"), DIM)),
+            // Rewrite the one line in place as pages arrive. `\x1b[K` clears
+            // whatever the longer previous count left behind.
+            let outcome =
+                app_lib::sync::parse_pdf_reporting(&self.data_dir, rel, *subject_id, &|p| {
+                    let seen = match p.total_pages {
+                        0 => format!("{} pages", p.pages_done),
+                        total => format!("{}/{total} pages", p.pages_done),
+                    };
+                    print!("\r{label}{}\x1b[K", paint(&seen, DIM));
+                    let _ = std::io::stdout().flush();
+                });
+            print!("\r{label}\x1b[K");
+            let parsed = match outcome {
+                Ok(summary) => summary.to_string(),
                 Err(e) => {
-                    println!("{}", paint(&e, RED));
+                    println!("{}", paint(&e.to_string(), RED));
                     failed += 1;
                     continue;
                 }
-            }
+            };
+            print!("{}", paint(&parsed, DIM));
+            let _ = std::io::stdout().flush();
 
             if !embed {
                 println!();
                 continue;
             }
 
+            // Everything printed so far on this line, so the embed's own
+            // counter can rewrite in place after it. Embedding is the slower
+            // half now — on an account with no payment method Voyage allows
+            // ~2.8 pages a minute, so a 200-page deck is over an hour and a
+            // line that never changes is indistinguishable from a hang.
+            let stem = format!("{label}{}  ", paint(&parsed, DIM));
             let outcome = self.rt.block_on(async {
                 let Some(file_id) = store::file_id(pool, *subject_id, rel).await? else {
                     return Err("not in the database".to_string());
                 };
                 let abs = self.data_dir.join(&pdf_rel).to_string_lossy().to_string();
-                app_lib::retrieval::ingest(&app_lib::paths::db_path(&self.data_dir), file_id, abs, false, 0, String::new()).await
+                let line = stem.clone();
+                app_lib::retrieval::ingest_reporting(
+                    &app_lib::paths::db_path(&self.data_dir),
+                    file_id,
+                    abs,
+                    false,
+                    std::sync::Arc::new(move |p: app_lib::embed::Progress| {
+                        let seen = match p.total_pages {
+                            0 => format!("embedding {} pages", p.pages_done),
+                            total => format!("embedding {}/{total} pages", p.pages_done),
+                        };
+                        print!("\r{line}{}\x1b[K", paint(&seen, DIM));
+                        let _ = std::io::stdout().flush();
+                    }),
+                )
+                .await
+                // The discriminants are for the app's pipeline row; a terminal
+                // has one line and prints the sentence.
+                .map_err(|e| e.message)
             });
+            print!("\r{stem}\x1b[K");
 
             match outcome {
                 Ok(s) => {
                     pages_total += s.pages_embedded;
                     println!(
-                        "  {}",
+                        "{}",
                         paint(&format!("{} pages, {} with text", s.pages_embedded, s.pages_with_markdown), DIM)
                     );
                 }
                 Err(e) => {
-                    println!("  {}", paint(&e, RED));
+                    println!("{}", paint(&e, RED));
                     failed += 1;
                 }
             }
@@ -1879,10 +1996,6 @@ impl Ctx {
                 paint("warning", YELLOW)
             );
         }
-        // The sidecar returns as soon as the fast pass has produced markdown
-        // and runs the slower, better parse afterwards. That text lands on the
-        // next `oculus index`.
-        println!("{}", paint("quality parses continue in the sidecar", DIM));
         Ok(())
     }
 
@@ -1906,11 +2019,12 @@ impl Ctx {
 
     /// Rank pages by meaning.
     ///
-    /// The two failure modes below are the point of this function. A caller
-    /// handed an empty result concludes the library has no answer and stops;
-    /// a caller told *why* it is empty tries the other door. So a missing
-    /// sidecar names `grep`, and an empty index names `index`, and both are
-    /// errors rather than a silent zero-hit success.
+    /// The failure modes below are the point of this function. A caller handed
+    /// an empty result concludes the library has no answer and stops; a caller
+    /// told *why* it is empty tries the other door. So an empty index names
+    /// `index`, and an index full of vectors from a retired model says so in
+    /// those words rather than reporting nothing indexed — both are errors
+    /// rather than a silent zero-hit success.
     fn search(&self, args: &SearchArgs) -> Result<(), String> {
         let pool = self.db().ok_or("the retrieval index lives in the database")?;
         let subjects = self.rt.block_on(store::subjects(&pool))?;
@@ -1926,18 +2040,26 @@ impl Ctx {
         let codes: HashMap<i64, String> =
             subjects.iter().map(|s| (s.id, s.code.clone())).collect();
 
-        if !sidecar_healthy() {
-            return Err(
-                "the sidecar is not running, so semantic search is unavailable.\n       \
-                 Open the Oculus app to start it, or search the same text literally:\n         \
-                 oculus grep \"<pattern>\""
-                    .to_string(),
-            );
-        }
-
         let db_file = app_lib::paths::db_path(&self.data_dir);
         let stats = self.rt.block_on(app_lib::retrieval::stats(&db_file))?;
         if stats.pages_embedded == 0 {
+            // "Nothing searchable" and "nothing stored" look identical from a
+            // count of zero and call for different actions, so they are told
+            // apart here. A library embedded by a retired model is the state
+            // every install is in immediately after the move to Voyage.
+            if stats.pages_stale > 0 {
+                return Err(format!(
+                    "{} page(s) are stored, but they were embedded by {} and cannot be\n       \
+                     compared against a query from {}. Re-run `oculus index` to rebuild them.",
+                    stats.pages_stale,
+                    if stats.stale_models.is_empty() {
+                        "a retired model".to_string()
+                    } else {
+                        stats.stale_models.join(", ")
+                    },
+                    stats.model.as_deref().unwrap_or("the current model"),
+                ));
+            }
             return Err(
                 "nothing is indexed yet, so there is nothing to rank.\n       \
                  Run `oculus index` over PDFs already on record, or `oculus run -s` to scrape."
@@ -2026,7 +2148,7 @@ impl Ctx {
             .iter()
             .map(|s| s.id)
             .collect();
-        let files = self.library_files(&pool, &ids)?;
+        let files = filter_categories(self.library_files(&pool, &ids)?, &args.category)?;
         let pages = self.page_text(&pool, &ids)?;
         let re = build_regex(&args.pattern, args.fixed, args.case_sensitive)?;
         let limit = args.limit.max(1);
@@ -2272,14 +2394,11 @@ impl Ctx {
             .collect();
 
         let needle = args.r#match.as_ref().map(|m| m.to_lowercase());
-        let all = self.library_files(&pool, &ids)?;
+        let all = filter_categories(self.library_files(&pool, &ids)?, &args.category)?;
         let rows: Vec<&LibFile> = all
             .iter()
             .filter(|f| {
                 args.r#type.as_ref().is_none_or(|t| f.file_type.eq_ignore_ascii_case(t))
-                    && args.category.as_ref().is_none_or(|c| {
-                        f.category.as_deref().is_some_and(|k| k.eq_ignore_ascii_case(c))
-                    })
                     && needle
                         .as_ref()
                         .is_none_or(|n| f.relative_path.to_lowercase().contains(n))
@@ -2644,11 +2763,14 @@ impl Ctx {
 
     fn task_list(&self, args: &TaskListArgs) -> Result<(), String> {
         let pool = self.planning_db()?;
+        let Some(project_id) = args.project else {
+            return self.task_list_across(&pool, args);
+        };
         let project = self
             .rt
-            .block_on(projects::project(&pool, args.project))?
-            .ok_or_else(|| format!("project {} does not exist", args.project))?;
-        let mut tasks = self.rt.block_on(projects::tasks(&pool, args.project))?;
+            .block_on(projects::project(&pool, project_id))?
+            .ok_or_else(|| format!("project {project_id} does not exist"))?;
+        let mut tasks = self.rt.block_on(projects::tasks(&pool, project_id))?;
 
         if let Some(column) = &args.column {
             if !project.columns.iter().any(|c| &c.id == column) {
@@ -2674,6 +2796,87 @@ impl Ctx {
             return Ok(());
         }
         print_board(&project, &tasks);
+        Ok(())
+    }
+
+    /// `task list` with no `-p`: every task there is, or only the unfiled ones.
+    ///
+    /// One board per project, under the project's own name, with the unfiled
+    /// pile first — the order `projects::all_tasks` comes back in, so the
+    /// grouping is one pass rather than a query per project. A column id could
+    /// not be filtered on here at all (it only means something against one
+    /// board), which is why `--column` `requires` `--project`.
+    fn task_list_across(&self, pool: &SqlitePool, args: &TaskListArgs) -> Result<(), String> {
+        let scope = if args.unfiled {
+            projects::TaskScope::Unfiled
+        } else {
+            projects::TaskScope::All
+        };
+        let mut tasks = self.rt.block_on(projects::all_tasks(pool, scope))?;
+        if let Some(before) = &args.due_before {
+            let before = projects::check_iso8601(before)?;
+            tasks.retain(|t| t.due_at.as_deref().is_some_and(|d| d < before.as_str()));
+        }
+        if self.json {
+            return self.emit(&tasks);
+        }
+        if tasks.is_empty() {
+            println!(
+                "{}",
+                paint(
+                    if args.unfiled {
+                        "nothing unfiled \u{2014} every task you have belongs to a project"
+                    } else {
+                        "no tasks yet \u{2014} oculus task add \"something to do\""
+                    },
+                    DIM
+                )
+            );
+            return Ok(());
+        }
+
+        // Read once and reused per group: a task carries its project's id, not
+        // its board, and the board is what the columns are printed in the
+        // order of. `status: "all"` — an archived project's tasks are still
+        // tasks, and dropping them would be a silently short list.
+        let all = self.rt.block_on(projects::projects(pool, projects::SubjectFilter::Any, "all"))?;
+
+        // A blank line *between* groups, never before the first one.
+        let mut written = false;
+        let unfiled: Vec<&projects::Task> =
+            tasks.iter().filter(|t| t.project_id.is_none()).collect();
+        if !unfiled.is_empty() {
+            println!("{}", paint("Unfiled", BOLD));
+            // The default board, which is the one an unfiled task's column is
+            // checked against (`projects::board_of`).
+            let rows: Vec<projects::Task> = unfiled.into_iter().cloned().collect();
+            print_columns(&projects::default_columns(), &rows);
+            written = true;
+        }
+        for project in &all {
+            let here: Vec<projects::Task> = tasks
+                .iter()
+                .filter(|t| t.project_id == Some(project.id))
+                .cloned()
+                .collect();
+            if here.is_empty() {
+                continue;
+            }
+            if written {
+                println!();
+            }
+            written = true;
+            println!(
+                "{} {}{}",
+                paint(&format!("#{}", project.id), DIM),
+                paint(&project.name, BOLD),
+                match &project.subject_code {
+                    Some(c) => paint(&format!("  {c}"), DIM),
+                    None => String::new(),
+                }
+            );
+            print_board(project, &here);
+        }
         Ok(())
     }
 
@@ -2783,6 +2986,57 @@ impl Ctx {
         self.print_task(&pool, args.id, Some(&args.column))
     }
 
+    fn task_refile(&self, args: &TaskRefileArgs) -> Result<(), String> {
+        let pool = self.planning_db()?;
+        // Two ways to say it and no default: refiling somewhere and refiling
+        // nowhere are both deliberate, and a bare `task refile 12` could only
+        // guess which was meant.
+        let destination = match (args.project, args.unfiled) {
+            (Some(id), false) => Some(id),
+            (None, true) => None,
+            _ => {
+                return Err(
+                    "say where: -p <PROJECT_ID>, or --unfiled to take it out of every project"
+                        .to_string(),
+                )
+            }
+        };
+        let rows = self
+            .rt
+            .block_on(projects::refile_task(&pool, args.id, destination))?;
+
+        // The project's *name*, not its id: the id is what was typed, and the
+        // name is the confirmation that it was the right one.
+        let label = match destination {
+            Some(id) => self
+                .rt
+                .block_on(projects::project(&pool, id))?
+                .map(|p| p.name)
+                .unwrap_or_else(|| format!("project {id}")),
+            None => "unfiled".to_string(),
+        };
+        if self.json {
+            return self.emit(&serde_json::json!({
+                "refiled": args.id,
+                "project_id": destination,
+                "project": label,
+                "rows": rows,
+            }));
+        }
+        if rows == 0 {
+            println!("{}", paint(&format!("task {} is already there", args.id), DIM));
+            return Ok(());
+        }
+        self.print_task(&pool, args.id, Some(&label))?;
+        if rows > 1 {
+            println!(
+                "{}",
+                paint(&format!("  {} subtask(s) came with it", rows - 1), DIM)
+            );
+        }
+        Ok(())
+    }
+
     fn task_rm(&self, args: &TaskRmArgs) -> Result<(), String> {
         let pool = self.planning_db()?;
         let rows = self.rt.block_on(projects::delete_task(&pool, args.id))?;
@@ -2827,7 +3081,6 @@ impl Ctx {
         let ffmpeg = app_lib::echo360::find_ffmpeg(None)
             .ok_or("no ffmpeg found — install it, or run `bun run ffmpeg`")?;
 
-        let diffs = app_lib::chapters::sample_diffs(&ffmpeg, &video, |_| {})?;
         // A missing or unreadable transcript costs the pause bonus and nothing
         // else, so it is not worth failing over.
         let gaps = transcript
@@ -2835,12 +3088,29 @@ impl Ctx {
             .and_then(|p| std::fs::read_to_string(p).ok())
             .map(|vtt| app_lib::chapters::cue_gaps(&vtt))
             .unwrap_or_default();
-        let found = app_lib::chapters::candidates(&diffs, &gaps, duration as u32);
+        let dir = app_lib::echo360::lecture_dir(&self.data_dir, &id);
+        // Which stream holds the slides is measured, not assumed; `--source`
+        // overrules it. See `app_lib::chapters::detect`.
+        let detected = app_lib::chapters::detect(
+            &ffmpeg,
+            &dir,
+            &video,
+            &gaps,
+            duration as u32,
+            args.source,
+            |_| {},
+        )?;
+        let found = &detected.candidates;
 
         let frames = if args.frames {
-            let dir = app_lib::echo360::lecture_dir(&self.data_dir, &id).join("frames");
             let seconds: Vec<u32> = found.iter().map(|c| c.seconds).collect();
-            Some(app_lib::chapters::extract_frames(&ffmpeg, &video, &seconds, &dir, |_| {})?)
+            Some(app_lib::chapters::extract_frames(
+                &ffmpeg,
+                &detected.video,
+                &seconds,
+                &dir.join("frames"),
+                |_| {},
+            )?)
         } else {
             None
         };
@@ -2851,6 +3121,7 @@ impl Ctx {
                 lecture: &'a str,
                 title: &'a str,
                 duration_seconds: i64,
+                source: u8,
                 sampled_seconds: usize,
                 candidates: &'a [app_lib::chapters::Candidate],
                 #[serde(skip_serializing_if = "Option::is_none")]
@@ -2860,20 +3131,26 @@ impl Ctx {
                 lecture: &id,
                 title: &title,
                 duration_seconds: duration,
-                sampled_seconds: diffs.len() + 1,
-                candidates: &found,
+                source: detected.source,
+                sampled_seconds: detected.diffs.len() + 1,
+                candidates: found,
                 frames: frames
                     .as_ref()
                     .map(|f| f.iter().map(|p| p.to_string_lossy().into_owned()).collect()),
             });
         }
 
-        println!("{}  {}", paint(&title, BOLD), paint(&clock(duration as u32), DIM));
+        println!(
+            "{}  {}  {}",
+            paint(&title, BOLD),
+            paint(&clock(duration as u32), DIM),
+            paint(&format!("source {}", detected.source), DIM)
+        );
         if found.is_empty() {
             println!("{}", paint("no boundaries — one continuous slide?", DIM));
             return Ok(());
         }
-        for c in &found {
+        for c in found {
             println!(
                 "  {}  {}{}",
                 clock(c.seconds),
@@ -2976,6 +3253,7 @@ impl Ctx {
                 lecture_id: &id,
                 selection: &selection,
                 force: args.force,
+                source: args.source,
             },
             // The terminal's progress is the agent's tool rows below; of the
             // pipeline's own steps only the candidate set is worth a line, and
@@ -3009,6 +3287,7 @@ impl Ctx {
                 provider: &'a str,
                 model: &'a str,
                 effort: Option<&'a str>,
+                source: u8,
                 candidates: usize,
                 chapters: &'a [app_lib::chapters::Chapter],
             }
@@ -3019,6 +3298,7 @@ impl Ctx {
                 provider: selection.provider.as_str(),
                 model: &selection.model,
                 effort: selection.effort(),
+                source: outcome.source,
                 candidates: outcome.candidates,
                 chapters: &outcome.chapters,
             });
@@ -3047,13 +3327,13 @@ impl Ctx {
         Ok(())
     }
 
-    /// Write a recording's slide-by-slide recap with a CLI agent.
+    /// Write a recording's reading copy with a CLI agent.
     ///
-    /// `recap::run` is the one implementation shared with the app. It owns
+    /// `reading::run` is the one implementation shared with the app. It owns
     /// the file checks, segmentation, retries, per-window transactions and
     /// status changes; this door only resolves the lecture and model flags
     /// and turns its progress into terminal output.
-    fn lecture_recap(&self, args: &LectureRecapArgs) -> Result<(), String> {
+    fn lecture_reading(&self, args: &LectureReadingArgs) -> Result<(), String> {
         use app_lib::harness::{jobs, Provider};
 
         let pool = self.db().ok_or("lectures live in the database")?;
@@ -3062,10 +3342,10 @@ impl Ctx {
         // Give the CLI-specific escape hatch in the early error. The runner
         // repeats this guard because the app calls it directly too.
         if !args.force {
-            let existing = self.rt.block_on(store::recap(&pool, &id))?;
+            let existing = self.rt.block_on(store::reading(&pool, &id))?;
             if !existing.is_empty() {
                 return Err(format!(
-                    "{title} already has {} recap note(s) — `--force` re-runs and replaces them",
+                    "{title} already has a reading copy of {} line(s) — `--force` re-runs and replaces it",
                     existing.len()
                 ));
             }
@@ -3073,7 +3353,7 @@ impl Ctx {
 
         let mut selection = self
             .rt
-            .block_on(jobs::selection(&pool, jobs::Job::LectureRecap));
+            .block_on(jobs::selection(&pool, jobs::Job::LectureReading));
         if let Some(p) = &args.provider {
             selection.provider = Provider::parse(p).ok_or("unknown provider")?;
         }
@@ -3103,24 +3383,25 @@ impl Ctx {
             );
         }
 
-        // The reply text is machine-shaped JSON and becomes the notes below;
+        // The reply text is machine-shaped JSON and becomes the lines below;
         // tool rows remain useful while each sequential window is running.
         let printer = AgentPrinter::new(false);
-        let outcome = app_lib::recap::run(
+        let outcome = app_lib::reading::run(
             self.rt.handle(),
             &pool,
-            &app_lib::recap::Run {
+            &app_lib::reading::Run {
                 data_dir: &self.data_dir,
                 lecture_id: &id,
                 selection: &selection,
                 force: args.force,
+                source: args.source,
             },
             |step| {
                 if quiet {
                     return;
                 }
                 match step {
-                    app_lib::recap::Step::Segmented {
+                    app_lib::reading::Step::Segmented {
                         title,
                         duration,
                         segments,
@@ -3130,7 +3411,7 @@ impl Ctx {
                         paint(&clock(duration), DIM),
                         paint(&format!("{segments} segment(s)"), DIM)
                     ),
-                    app_lib::recap::Step::Window {
+                    app_lib::reading::Step::Window {
                         done,
                         total,
                         start,
@@ -3165,9 +3446,10 @@ impl Ctx {
                 provider: &'a str,
                 model: &'a str,
                 effort: Option<&'a str>,
+                source: u8,
                 segments: usize,
                 windows: usize,
-                notes: &'a [app_lib::recap::RecapNote],
+                lines: &'a [app_lib::reading::ReadingLine],
             }
             return self.emit(&Out {
                 lecture: &id,
@@ -3176,31 +3458,23 @@ impl Ctx {
                 provider: selection.provider.as_str(),
                 model: &selection.model,
                 effort: selection.effort(),
+                source: outcome.source,
                 segments: outcome.segments,
                 windows: outcome.windows,
-                notes: &outcome.notes,
+                lines: &outcome.lines,
             });
         }
 
         println!();
-        for note in &outcome.notes {
-            let label = match note.label.trim() {
-                "" => "Recap",
-                label => label,
-            };
-            println!(
-                "  {}  {}",
-                paint(&clock(note.start_seconds), DIM),
-                paint(label, BOLD)
-            );
-            println!("            {}", paint(&note.body, DIM));
+        for line in &outcome.lines {
+            println!("  {}  {}", paint(&clock(line.start_seconds), DIM), line.text);
         }
         println!(
             "{}",
             paint(
                 &format!(
-                    "{} recap note(s) written for {}",
-                    outcome.notes.len(),
+                    "{} line(s) written for {}",
+                    outcome.lines.len(),
                     outcome.title
                 ),
                 DIM
@@ -3468,7 +3742,7 @@ impl Ctx {
 const HELP_WIDTH: usize = 88;
 
 /// Documented once at the root instead of under every subcommand.
-const GLOBAL_ARGS: [&str; 2] = ["json", "memory_cap"];
+const GLOBAL_ARGS: [&str; 1] = ["json"];
 
 /// This binary's whole help tree as markdown.
 ///
@@ -3482,8 +3756,8 @@ fn render_cli_docs() -> String {
     out.push_str("<!-- Generated by `oculus docs` from the binary's own help. Do not edit:\n");
     out.push_str("     change the CLI and regenerate, or the file will lie to whoever reads it. -->\n\n");
     out.push_str("# The `oculus` CLI\n\n");
-    out.push_str("`--json` and `--memory-cap` are global: they work on every command below,\n");
-    out.push_str("and are listed once here rather than repeated in each section.\n\n");
+    out.push_str("`--json` is the one global flag: it works on every command below,\n");
+    out.push_str("and is listed once here rather than repeated in each section.\n\n");
     out.push_str(&help_block(&root, "oculus", true));
     for sub in root.get_subcommands() {
         render_subcommand(sub, "oculus", 2, &mut out);
@@ -3525,16 +3799,6 @@ fn help_block(cmd: &clap::Command, path: &str, globals: bool) -> String {
     let help = cmd.render_long_help().to_string();
     let body: Vec<&str> = help.lines().map(|l| l.trim_end()).collect();
     format!("```\n{}\n```\n", body.join("\n").trim_end())
-}
-
-fn sidecar_healthy() -> bool {
-    ureq::get(&format!(
-        "http://127.0.0.1:{}/health",
-        app_lib::sidecar::SIDECAR_PORT
-    ))
-    .timeout(std::time::Duration::from_millis(500))
-    .call()
-    .is_ok()
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -3723,6 +3987,69 @@ mod query_tests {
         assert!(resolve_file(&files, "week-01.pdf").is_err());
         assert!(resolve_file(&files, "nothing-like-this").is_err());
     }
+
+    fn filed(rel: &str, category: &str) -> LibFile {
+        LibFile { category: Some(category.to_string()), ..file("COMP30026", rel) }
+    }
+
+    /// A category narrows *before* the match limit, which is the point of
+    /// having it: `grep` scans subject then path and stops, so a broad
+    /// pattern otherwise spends its whole budget in one folder.
+    #[test]
+    fn categories_narrow_the_scan() {
+        let rows = || {
+            vec![
+                filed("courses/COMP30026/ed/0001-teams.md", "ed"),
+                filed("courses/COMP30026/announcements/2026-07-14-welcome.md", "announcement"),
+                filed("courses/COMP30026/files/week-01.pdf", "file"),
+            ]
+        };
+
+        let kept = filter_categories(rows(), &["ed".into()]).ok().unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].category.as_deref(), Some("ed"));
+
+        // Repeatable, and case is not the caller's problem.
+        let pair = filter_categories(rows(), &["ED".into(), "announcement".into()]).ok().unwrap();
+        assert_eq!(pair.len(), 2);
+
+        // No flag is every category, not none.
+        assert_eq!(filter_categories(rows(), &[]).ok().unwrap().len(), 3);
+    }
+
+    /// The split that makes the refusal worth having: a word that is not a
+    /// category is a mistake and must say so, while a real category these
+    /// rows happen not to have is a fair question with an empty answer.
+    /// Validating against the rows collapses the two, and refuses
+    /// `--subject INFO30006 --category quiz` for a subject with no quizzes.
+    #[test]
+    fn a_typo_is_refused_but_an_honest_miss_is_empty() {
+        let rows = || vec![filed("courses/COMP30026/ed/0001-teams.md", "ed")];
+
+        let err = filter_categories(rows(), &["eds".into()]).err().unwrap();
+        assert!(err.contains("no category \"eds\""), "{err}");
+        // The refusal names the real ones, from the one list that defines them.
+        assert!(err.contains("announcement"), "{err}");
+        assert!(err.contains("quiz"), "{err}");
+
+        // Real category, none in these rows: empty, not an error.
+        assert!(filter_categories(rows(), &["quiz".into()]).ok().unwrap().is_empty());
+
+        // And an empty row set does not excuse the typo — the early return
+        // that used to sit here let `-s <unsynced> -c nonsense` exit 0.
+        assert!(filter_categories(vec![], &["eds".into()]).is_err());
+        assert!(filter_categories(vec![], &["quiz".into()]).ok().unwrap().is_empty());
+    }
+
+    /// Both commands spell the flag the same way, so they must accept the
+    /// same words and offer the same list.
+    #[test]
+    fn the_category_help_lists_what_the_flag_accepts() {
+        let help = category_help();
+        for c in paths::CATEGORIES {
+            assert!(help.contains(c), "{c:?} missing from {help:?}");
+        }
+    }
 }
 
 // ── Subject filtering ────────────────────────────────────────────────────────
@@ -3732,6 +4059,51 @@ mod query_tests {
 fn matches_code(code: &str, wanted: &str) -> bool {
     let (code, wanted) = (code.to_uppercase(), wanted.to_uppercase());
     code == wanted || code.starts_with(&format!("{wanted}_"))
+}
+
+/// Narrow a file list to the categories asked for, and **refuse a category
+/// that is not one** rather than returning nothing — the same trade `oculus
+/// task add` makes with an unknown column id. A silent empty result from a
+/// typo reads exactly like "the library does not cover that", which is the
+/// one answer a search must never give by accident.
+///
+/// Validity is `paths::CATEGORIES`, not the categories these particular rows
+/// happen to carry. Reading the set off the rows looks tighter and is the
+/// wrong question: `--subject INFO30006 --category quiz` would then be
+/// refused for a subject that simply has no quizzes, which is a well-formed
+/// query and deserves an empty answer, not an error. What a typo and an
+/// honest miss have in common is that both return nothing; what separates
+/// them is whether the word is a category at all, and only the canonical
+/// list knows that.
+///
+/// Shared by `grep` and `files` so the same flag spelled the same way on two
+/// sibling commands cannot disagree about what it accepts.
+fn filter_categories(files: Vec<LibFile>, wanted: &[String]) -> Result<Vec<LibFile>, String> {
+    if wanted.is_empty() {
+        return Ok(files);
+    }
+    for c in wanted {
+        if !paths::CATEGORIES.iter().any(|k| k.eq_ignore_ascii_case(c)) {
+            return Err(format!(
+                "no category {c:?} — the categories are: {}",
+                paths::CATEGORIES.join(", ")
+            ));
+        }
+    }
+    Ok(files
+        .into_iter()
+        .filter(|f| {
+            f.category
+                .as_deref()
+                .is_some_and(|k| wanted.iter().any(|c| k.eq_ignore_ascii_case(c)))
+        })
+        .collect())
+}
+
+/// The `--category` help on both commands, so the list a reader is offered is
+/// the list the flag validates against.
+fn category_help() -> String {
+    format!("Only these categories ({}). Repeatable", paths::CATEGORIES.join(", "))
 }
 
 fn filter_subjects(
@@ -3899,7 +4271,7 @@ impl AgentPrinter {
                     .collect();
                 let _ = writeln!(out, "{}", paint(&format!("  limits: {}", parts.join(", ")), DIM));
             }
-            HarnessEvent::Error { message } => {
+            HarnessEvent::Error { message, .. } => {
                 end_line(&mut mid, &mut out);
                 let _ = writeln!(out, "{} {message}", paint("error:", RED));
             }
@@ -3918,7 +4290,14 @@ fn clock(secs: u32) -> String {
 }
 
 fn print_board(project: &projects::Project, tasks: &[projects::Task]) {
-    for column in &project.columns {
+    print_columns(&project.columns, tasks);
+}
+
+/// The same, given the columns alone — which is what an **unfiled** task's
+/// board is: `projects::default_columns()`, the four ids its `column_id` is
+/// checked against, with no project to read them off.
+fn print_columns(columns: &[projects::Column], tasks: &[projects::Task]) {
+    for column in columns {
         let here: Vec<&projects::Task> =
             tasks.iter().filter(|t| t.column_id == column.id).collect();
         if here.is_empty() {

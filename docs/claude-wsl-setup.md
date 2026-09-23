@@ -50,7 +50,11 @@ its namespace, setup stops; diagnose the failure against
 ## Sign in
 
 Linux Claude has its own authentication state. A native Windows Claude
-installation or login does not automatically sign in the Linux copy. Run:
+installation or login does not automatically sign in the Linux copy. Once
+WSL setup is complete, Settings → AI → Claude → Sign in runs this Linux
+login from the app: follow the browser link and paste the code into its
+dialog when requested. Closing the dialog cancels the Linux login process;
+successful completion refreshes discovery. To sign in from a terminal, run:
 
 ```powershell
 wsl.exe --distribution Oculus --user oculus --cd /home/oculus --exec /home/oculus/.local/bin/claude auth login
@@ -110,6 +114,10 @@ process and privileged-socket escapes, invalid working directories, and
 detached descendant cleanup after EOF or missing owner heartbeats. They also
 verify that valid heartbeats keep a session alive. Live Claude authentication
 and a real chat turn are separate integration checks.
+
+The suite also checks sign-in code forwarding and cancellation on Windows
+owner EOF, and that generated skills and their provider routes remain
+read-only inside the otherwise writable `agents/` folder.
 
 ## Opt-in live integration check
 

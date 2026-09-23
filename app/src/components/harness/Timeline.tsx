@@ -15,15 +15,30 @@ import {
 } from "@phosphor-icons/react";
 import type { Icon } from "@phosphor-icons/react";
 import { MATH, MD_COMPONENTS, normalizeMath } from "@/components/markdown/MdComponents";
+import { FileChip } from "@/components/markdown/FileChip";
+import { openLibraryPath, splitLibraryPaths, type TextPart } from "@/lib/openFile";
+import { attachmentSrc } from "@/lib/attachments";
+import { ImageLightbox } from "@/components/ui/Lightbox";
+import { selectionMarkdown } from "@/lib/selectionMarkdown";
+import { useDataDir } from "@/hooks/useDataDir";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { fmtClock, sqliteUtcToMs } from "@/lib/format";
 import { fmtTime } from "@/lib/lectures";
-import { messageAt, parseToolMeta, type HarnessItem, type ToolKind } from "@/lib/harness";
+import {
+  messageAt,
+  parseErrorMeta,
+  parseToolMeta,
+  type HarnessItem,
+  type Provider,
+  type ToolKind,
+} from "@/lib/harness";
+import { useSignInStatus } from "@/hooks/useSignInStatus";
 import { useHarnessStore } from "@/stores/harnessStore";
 import { cn, copyText } from "@/lib/utils";
 import { ErrorRow, RowShell, ThinkingRow, ToolRow, TOOL_ICON } from "./WorkRow";
+import { SignInDialog, useSignIn } from "./SignInDialog";
 
 /** Editing a question, or one still waiting to be asked, both happen in the
  *  bubble itself rather than back in the composer: the thread is where the
@@ -123,14 +138,14 @@ const WITH_MATH = [remarkGfm, remarkMath];
 const KATEX = [rehypeKatex];
 const NO_PLUGINS: never[] = [];
 
-/** `chat-md` scales the shared markdown components down to chat's own size —
+/** `md-compact` scales the shared markdown components down to a panel's size —
  *  see the rule in `app/src/index.css`. The components themselves are sized
  *  for a document (the file viewer), which is a size too large for a reply. */
 const Assistant = memo(function Assistant({ text }: { text: string }) {
   const math = MATH.test(text);
   const body = math ? normalizeMath(text) : text;
   return (
-    <div className="chat-md min-w-0 px-2 text-[13px] leading-relaxed">
+    <div className="md-compact min-w-0 px-2 text-[13px] leading-relaxed">
       <ReactMarkdown
         remarkPlugins={math ? WITH_MATH : PLAIN}
         rehypePlugins={math ? KATEX : NO_PLUGINS}
@@ -214,6 +229,10 @@ function MessageActions({
 }) {
   return (
     <div
+      // Furniture, not the conversation: a selection dragged across several
+      // messages must not come out with a clock time between them
+      // (`selectionMarkdown`).
+      data-copy-skip
       className={cn(
         "-mt-0.5 flex h-8 items-center gap-1 text-[11px] text-muted-foreground opacity-0 transition-opacity focus-within:opacity-100 group-hover/msg:opacity-100",
         side === "right" ? "justify-end" : "pl-1",
@@ -263,6 +282,54 @@ function useOverflows(text: string, shown: boolean) {
 }
 
 /**
+ * The pictures a question attached, lifted out of its prose, and the prose
+ * with the holes they left closed up.
+ *
+ * Attachments go *above* the words — the shape every chat UI has settled on,
+ * and the one the composer's own strip already draws. Inline they were a
+ * 240px block dropped into the middle of a sentence, and five of them turned
+ * a two-line question into a column of gaps.
+ *
+ * Closing the hole is this function's other half. The composer writes the
+ * paths on their own line under the message, so removing them leaves a
+ * trailing blank line `whitespace-pre-wrap` would faithfully draw; a picture
+ * quoted back *inside* a sentence leaves the two spaces that were around it.
+ * Both are swept here and not in `splitLibraryPaths`, which the composer's
+ * own editor shares and which must hand back the text exactly as it was.
+ */
+function liftPictures(parts: TextPart[]): [Extract<TextPart, { kind: "image" }>[], TextPart[]] {
+  const pictures = parts.filter((p) => p.kind === "image");
+  if (!pictures.length) return [pictures, parts];
+
+  // Two runs of prose that were only ever separated by a picture are one run
+  // now, and the seam between them collapses: a single space inside a line,
+  // nothing at all across a break.
+  const body: TextPart[] = [];
+  for (const p of parts) {
+    if (p.kind === "image") continue;
+    const last = body[body.length - 1];
+    if (p.kind === "text" && last?.kind === "text") {
+      const left = last.text.replace(/[ \t]+$/, "");
+      const right = p.text.replace(/^[ \t]+/, "");
+      const gap = !left || !right || /\n\s*$/.test(left) || /^\s*\n/.test(right) ? "" : " ";
+      body[body.length - 1] = { kind: "text", text: left + gap + right };
+    } else {
+      body.push(p);
+    }
+  }
+
+  // …and the ends, where the message's own last line used to be followed by
+  // a strip of paths.
+  const first = body[0];
+  if (first?.kind === "text") body[0] = { kind: "text", text: first.text.replace(/^\s+/, "") };
+  const last = body[body.length - 1];
+  if (last?.kind === "text")
+    body[body.length - 1] = { kind: "text", text: last.text.replace(/\s+$/, "") };
+
+  return [pictures, body.filter((p) => p.kind !== "text" || p.text.length > 0)];
+}
+
+/**
  * A question: the student's own words, on the right.
  *
  * Editing happens in the bubble itself rather than back in the composer —
@@ -295,8 +362,22 @@ function QuestionBubble({
 }) {
   const [editing, setEditing] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
+  /** The picture being looked at, as the src the card already drew — opening
+   *  one is a viewer over the thread, not a trip out to the OS. */
+  const [shown, setShown] = useState<string | null>(null);
+  // One IPC call for the whole app, so a thread of bubbles costs nothing
+  // (`useDataDir`). Only a bubble holding a picture ever reads it.
+  const dataDir = useDataDir();
   const [body, long] = useOverflows(text, editing === null);
   const box = useRef<HTMLTextAreaElement>(null);
+  // The mentions in the question, drawn as the chips they were picked as
+  // rather than as the paths the agent was sent. Split on shape, so a bubble
+  // costs no query — see `splitLibraryPaths`.
+  const parts = useMemo(() => splitLibraryPaths(text), [text]);
+  // Attachments above, prose below — and the prose is what the fold measures
+  // and can hide, because a picture the student attached is the question's
+  // subject and never the part worth folding away.
+  const [pictures, prose] = useMemo(() => liftPictures(parts), [parts]);
 
   useLayoutEffect(() => {
     const el = box.current;
@@ -345,40 +426,105 @@ function QuestionBubble({
 
   return (
     <div className="group/msg flex w-full flex-col">
-      <div data-msg-id={msgId} className="flex w-full justify-end">
-        <div
-          className={cn(
-            "max-w-[70%] min-w-0 rounded-xl border px-3.5 py-2 text-[13px] leading-relaxed",
-            pending
-              ? "border-dashed border-border bg-transparent text-muted-foreground"
-              : "border-border bg-surface text-foreground",
-          )}
-        >
-          <div
-            ref={body}
-            // The fade is a mask rather than a gradient over the top: the
-            // bubble behind it is two different grounds (queued is
-            // transparent), and a mask does not need to know which.
-            className={cn(
-              "whitespace-pre-wrap break-words",
-              long && !open && "overflow-hidden [mask-image:linear-gradient(to_bottom,#000_calc(100%-2.25rem),transparent)]",
-            )}
-            style={long && !open ? { maxHeight: QUESTION_MAX_H } : undefined}
-          >
-            {text}
+      {/* One viewer for the message, not one per card: only one picture can
+          be open at a time, and a dialog per thumbnail would be a portal per
+          thumbnail. */}
+      <ImageLightbox
+        src={shown ?? ""}
+        alt="Attached picture"
+        open={shown !== null}
+        onOpenChange={(o) => !o && setShown(null)}
+      />
+      {/* The landmark the rail measures is the question as drawn — its
+          pictures and its words, but not the action row under them, which
+          appears on hover and would make a tick jump. */}
+      <div data-msg-id={msgId} className="flex w-full flex-col items-end gap-1.5">
+        {pictures.length > 0 && (
+          // The pictures themselves, not chips, and **beside the bubble
+          // rather than inside it**: what was attached is what the question
+          // was about, a filename of digits says nothing about it, and every
+          // chat UI has settled on the same shape — cards of their own above
+          // the words. Clicking one opens it full size the way any other file
+          // in the library opens.
+          //
+          // One picture draws at its own size. Several become a three-across
+          // grid that wraps, each card letterboxing its picture on the
+          // bubble's own ground instead of cropping it square: what a student
+          // attaches here is a screenshot of a question, and a crop of one is
+          // unreadable, which is the whole point of drawing it at all.
+          <div className="flex max-w-[70%] flex-wrap justify-end gap-1.5">
+            {pictures.map((p, i) => (
+              <button
+                key={i}
+                type="button"
+                aria-label="Open the attached picture"
+                onClick={() => setShown(attachmentSrc(dataDir, p.path))}
+                className={cn(
+                  "cursor-pointer overflow-hidden rounded-xl border border-border bg-surface transition-colors hover:border-ring",
+                  pictures.length === 1
+                    ? "max-w-full"
+                    : "aspect-video w-[calc((100%-0.75rem)/3)]",
+                )}
+              >
+                <img
+                  src={attachmentSrc(dataDir, p.path)}
+                  alt="Attached picture"
+                  className={cn(
+                    "block",
+                    pictures.length === 1
+                      ? "max-h-72 w-auto max-w-full"
+                      : "h-full w-full object-contain",
+                  )}
+                />
+              </button>
+            ))}
           </div>
-          {long && (
-            <button
-              type="button"
-              aria-expanded={open}
-              onClick={() => setOpen((o) => !o)}
-              className="mt-1.5 flex cursor-pointer items-center gap-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+        )}
+        {(prose.length > 0 || pictures.length === 0) && (
+          <div
+            className={cn(
+              "max-w-[70%] min-w-0 rounded-xl border px-3.5 py-2 text-[13px] leading-relaxed",
+              pending
+                ? "border-dashed border-border bg-transparent text-muted-foreground"
+                : "border-border bg-surface text-foreground",
+            )}
+          >
+            <div
+              ref={body}
+              // The fade is a mask rather than a gradient over the top: the
+              // bubble behind it is two different grounds (queued is
+              // transparent), and a mask does not need to know which.
+              className={cn(
+                "whitespace-pre-wrap break-words",
+                long && !open && "overflow-hidden [mask-image:linear-gradient(to_bottom,#000_calc(100%-2.25rem),transparent)]",
+              )}
+              style={long && !open ? { maxHeight: QUESTION_MAX_H } : undefined}
             >
-              {open ? "Show less" : "Show more"}
-              <CaretDown size={11} className={cn("transition-transform", open && "rotate-180")} />
-            </button>
-          )}
-        </div>
+              {prose.map((p, i) => {
+                if (p.kind === "text") return p.text;
+                return (
+                  <FileChip
+                    key={i}
+                    path={p.path}
+                    onClick={(newTab) => openLibraryPath(p.path, newTab)}
+                  />
+                );
+              })}
+            </div>
+            {long && (
+              <button
+                type="button"
+                data-copy-skip
+                aria-expanded={open}
+                onClick={() => setOpen((o) => !o)}
+                className="mt-1.5 flex cursor-pointer items-center gap-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+              >
+                {open ? "Show less" : "Show more"}
+                <CaretDown size={11} className={cn("transition-transform", open && "rotate-180")} />
+              </button>
+            )}
+          </div>
+        )}
       </div>
       <MessageActions when={pending ? "Queued" : when} at={pending ? null : at} side="right">
         <CopyAction text={text} />
@@ -488,6 +634,7 @@ const Item = memo(function Item({
   dim,
   actions,
   asked,
+  onSignIn,
 }: {
   item: HarnessItem;
   dim: boolean;
@@ -496,6 +643,11 @@ const Item = memo(function Item({
   /** For an answer: the question above it. Memoised with `items`, so the
    *  object identity is as stable as the rows are. */
   asked?: { id: number; text: string };
+  /** Opens the sign-in dialog for a signed-out agent. It is `setState` from
+   *  the `Timeline` below, so its identity is stable on the same terms
+   *  `actions` is — the dialog has to outlive this row re-rendering, and a
+   *  fresh closure per render would un-memoise every row in the thread. */
+  onSignIn?: (provider: Provider) => void;
 }) {
   switch (item.kind) {
     case "user":
@@ -507,7 +659,9 @@ const Item = memo(function Item({
     case "tool":
       return <Tool item={item} dim={dim} />;
     case "error":
-      return <ErrorRow text={item.content ?? ""} />;
+      return (
+        <ErrorRow text={item.content ?? ""} auth={parseErrorMeta(item).auth} onSignIn={onSignIn} />
+      );
     case "interrupted":
       return <Stopped />;
   }
@@ -577,6 +731,43 @@ function Pending({ threadId, actions }: { threadId: number; actions: PendingActi
   );
 }
 
+/**
+ * Copying out of a thread gives **markdown**, not the words as they are set.
+ *
+ * What the browser would put on the clipboard is the rendering: a heading
+ * without its `#`, a table as a run of words, a formula as KaTeX's glyphs. The
+ * Copy button under a message has the source string and hands that over; a
+ * selection dragged across half an answer has no source string, so the DOM
+ * inside it is read back into markdown instead (`lib/selectionMarkdown.ts`).
+ *
+ * Only `text/plain` is written, which is the flavour a notes app, an editor
+ * and another agent all take. Plain text is a later choice — the right-click
+ * menu this app does not have yet is where it belongs.
+ */
+function markdownFor(target: EventTarget | null): string {
+  // A selection inside a field belongs to the field, and it is already text.
+  if (target instanceof Element && target.closest("input, textarea, [contenteditable='true']")) {
+    return "";
+  }
+  return selectionMarkdown(window.getSelection());
+}
+
+function copyAsMarkdown(e: React.ClipboardEvent) {
+  const md = markdownFor(e.target);
+  if (!md) return;
+  e.clipboardData.setData("text/plain", md);
+  // Without this the browser writes its own flavours over ours.
+  e.preventDefault();
+}
+
+/** The same text, dragged out instead of copied. **No `preventDefault` here**:
+ *  on `dragstart` that cancels the drag outright (CLAUDE.md) — `setData` alone
+ *  replaces what WebKit had already put on the transfer. */
+function dragAsMarkdown(e: React.DragEvent) {
+  const md = markdownFor(e.target);
+  if (md) e.dataTransfer.setData("text/plain", md);
+}
+
 export interface PendingActions {
   editQueued: (queueId: string, text: string) => void;
   unqueue: (queueId: string) => void;
@@ -596,6 +787,24 @@ export function Timeline({
   questions?: QuestionActions;
   pending?: PendingActions;
 }) {
+  /**
+   * Which agent's sign-in dialog is open, if any.
+   *
+   * Here rather than inside the row that offers it, for the reason the install
+   * run sits in its Settings section: the dialog and the flow behind it have
+   * to survive the row re-rendering — and a thread re-renders constantly, both
+   * ends of every turn. `setSignIn` is React's own setter, so handing it
+   * straight to a memoised `Item` costs that memoisation nothing.
+   *
+   * It lives in `Timeline` rather than in `ChatPage` because the timeline is
+   * the surface that is in two places: the chat page and the lecture player's
+   * dock. A failed turn shows the same card in both, so the dialog has to be
+   * in both too.
+   */
+  const [signIn, setSignIn] = useState<Provider | null>(null);
+  const { recheck } = useSignInStatus();
+  const run = useSignIn(recheck);
+
   const rows = useMemo(() => buildRows(items, running), [items, running]);
   // Which question each answer answered — what Retry asks again. Built with
   // the rows so the object handed to a memoised row keeps its identity.
@@ -609,7 +818,11 @@ export function Timeline({
     return map;
   }, [items]);
   return (
-    <div className="flex min-w-0 flex-col gap-2">
+    <div
+      className="flex min-w-0 flex-col gap-2"
+      onCopy={copyAsMarkdown}
+      onDragStart={dragAsMarkdown}
+    >
       {rows.map((r) =>
         r.kind === "bundle" ? (
           <Bundle key={r.id} items={r.items} />
@@ -620,12 +833,30 @@ export function Timeline({
             dim={r.dim}
             actions={questions}
             asked={asked.get(r.item.id)}
+            onSignIn={setSignIn}
           />
         ),
       )}
       {threadId != null && <ContextDrift threadId={threadId} />}
       {threadId != null && <LiveTail threadId={threadId} />}
       {threadId != null && pending && <Pending threadId={threadId} actions={pending} />}
+      {signIn && (
+        <SignInDialog
+          provider={signIn}
+          run={run.run?.provider === signIn ? run.run : null}
+          onStart={() => run.start(signIn)}
+          onCode={(code) => run.submitCode(code)}
+          onCancel={() => run.cancel()}
+          onClose={() => {
+            // A finished run is cleared with the dialog, so reopening the card
+            // offers the sign-in again rather than a log of what already
+            // happened. One still in flight is kept — the browser is still
+            // open on it — and reopening resumes the same run.
+            if (run.run?.result) run.clear();
+            setSignIn(null);
+          }}
+        />
+      )}
     </div>
   );
 }

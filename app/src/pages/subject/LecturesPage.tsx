@@ -44,6 +44,7 @@ import { recordRecent } from "@/lib/recents";
 import {
   fmtDuration,
   fmtLectureDate,
+  lecturePagePath,
   progressLabel,
   LECTURES_CHANGED_EVENT,
 } from "@/lib/lectures";
@@ -68,6 +69,7 @@ function RowAction({
     <div
       role="button"
       tabIndex={0}
+      data-tab-skip
       aria-label={label}
       title={label}
       onClick={(e) => {
@@ -229,6 +231,10 @@ export default function SubjectLecturesPage() {
                 return (
                   <button
                     key={lec.id}
+                    /* The row opens the lecture as a peek; ⌘-click wants the
+                       same lecture as a page of its own, which is where this
+                       leads (`lib/newTabClicks.ts`). */
+                    data-tab-href={lecturePagePath(lec)}
                     onClick={() => handleSelectLecture(lec)}
                     className={cn(
                       "w-full text-left px-3 py-2.5 flex gap-3 items-center hover:bg-surface transition-colors",
@@ -327,7 +333,7 @@ export default function SubjectLecturesPage() {
             <DialogTitle>Delete this download?</DialogTitle>
             <DialogDescription>
               {pendingDelete
-                ? `The video file for “${pendingDelete.title}” is removed from this device. Your place in it, the transcript and any chapters or recap notes are kept, and you can download it again whenever you want.`
+                ? `The video file for “${pendingDelete.title}” is removed from this Mac. Your place in it, the transcript and any chapters or reading copy are kept, and you can download it again whenever you want.`
                 : ""}
             </DialogDescription>
           </DialogHeader>

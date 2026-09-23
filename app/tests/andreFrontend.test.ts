@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { compareTermsNewestFirst, TERM_RANK_SQL, termRank } from "../src/lib/terms";
-import { getSubjects, setSubjectSelected, upsertSubjects } from "../src/lib/db";
+import { getSubjects, searchPageText, setSubjectSelected, SNIP_OPEN, SNIP_CLOSE, upsertSubjects } from "../src/lib/db";
 import { docPdfRelPath, isPdfBacked, PDF_BACKED_SQL_LIST, parsedMdRelPath } from "../src/lib/fileTypes";
 import { SyncWriteQueue } from "../src/lib/syncWrites";
 import { queueParseEvent } from "../src/lib/parseEvents";
@@ -116,19 +116,69 @@ test("Excel downloads and uploads use derived PDFs in every pipeline query", () 
   expect(isPdfBacked("notes.csv")).toBe(false);
 });
 
+describe("full-text document search", () => {
+  beforeEach(() => {
+    db.run("ALTER TABLE files ADD COLUMN filename TEXT");
+    db.run("ALTER TABLE files ADD COLUMN category TEXT");
+    db.run("CREATE TABLE pages (id INTEGER PRIMARY KEY, file_id INTEGER, page_no INTEGER, markdown TEXT)");
+    db.run("CREATE VIRTUAL TABLE pages_fts USING fts5(markdown, content='pages', content_rowid='id', tokenize='unicode61 remove_diacritics 2')");
+    db.run("INSERT INTO subjects VALUES (1, 'PAST', 'Past subject', '2025 Semester 2', 0, 'available', 0), (2, 'CURRENT', 'Current subject', '2026 Semester 2', 1, 'available', 1)");
+    for (const [id, subject] of [[1, 1], [2, 2], [3, 2]]) {
+      db.run("INSERT INTO files (id, subject_id, relative_path, filename, category) VALUES (?, ?, ?, ?, 'lecture')",
+        [id, subject, `courses/${subject}/files/${id}.pdf`, `${id}.pdf`]);
+    }
+  });
+
+  function page(id: number, fileId: number, pageNo: number, markdown: string) {
+    db.run("INSERT INTO pages VALUES (?, ?, ?, ?)", [id, fileId, pageNo, markdown]);
+    db.run("INSERT INTO pages_fts (rowid, markdown) VALUES (?, ?)", [id, markdown]);
+  }
+
+  test("returns one best page per file with its matching snippet", async () => {
+    page(1, 1, 1, "Eigenvalues introduction " + "unrelated ".repeat(80));
+    page(2, 1, 2, "Eigenvalues eigenvalues important");
+    page(3, 2, 1, "Eigenvalues distinct result");
+    const hits = await searchPageText("Eigenvalues");
+    expect(hits.map((hit) => hit.file_id)).toEqual([1, 2]);
+    expect(hits[0]).toMatchObject({ page_no: 2, subject_code: "PAST", filename: "1.pdf" });
+    expect(hits[0].snippet).toContain(`${SNIP_OPEN}Eigenvalues${SNIP_CLOSE}`);
+    expect(hits[0].snippet).toContain("important");
+    expect(hits[0].snippet).not.toContain("introduction");
+  });
+
+  test("tied page scores choose the earliest page and retain its own snippet", async () => {
+    page(1, 1, 3, "Eigenvalues later theorem");
+    page(2, 1, 1, "Eigenvalues earlier theorem");
+    const hits = await searchPageText("Eigen");
+    expect(hits).toHaveLength(1);
+    expect(hits[0].page_no).toBe(1);
+    expect(hits[0].snippet).toContain("earlier");
+    expect(hits[0].snippet).not.toContain("later");
+  });
+
+  test("tied files prefer current subjects, respect the limit, and ignore orphan index rows", async () => {
+    for (const id of [3, 1, 2]) page(id, id, 1, "Eigenvalues identical theorem");
+    // A stale index entry must not survive the join to its deleted page.
+    page(99, 1, 99, "Eigenvalues stale theorem");
+    db.run("DELETE FROM pages WHERE id=99");
+    expect((await searchPageText("Eigenvalues", 2)).map((hit) => hit.file_id)).toEqual([2, 3]);
+    expect((await searchPageText("Eigenvalues", 10)).map((hit) => hit.file_id)).toEqual([2, 3, 1]);
+  });
+});
+
 describe("sync metadata completion barrier", () => {
   test("a quality completion behind a blocked write ignores its trailing running heartbeat", async () => {
     const queue = new SyncWriteQueue();
     const path = "courses/TEST/files/slides.pdf";
     db.run("INSERT INTO files VALUES (1, 1, ?, 'running', NULL)", [path]);
     useParseStore.getState().update({ relative_path: path, subject_id: 1, status: "running" });
-    usePipelineStore.getState().touch(path, 1, { quality: "active" });
+    usePipelineStore.getState().touch(path, 1, { parse: "active" });
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     void queue.enqueue(7, "prior file write", () => gate, () => {});
     const parsed: string[] = [];
     const errors: string[] = [];
-    for (const status of ["quality", "running", "embedding", "embedded"]) {
+    for (const status of ["quality", "running"]) {
       void queueParseEvent(queue, 7, { relative_path: path, subject_id: 1, status },
         (_, savedPath) => parsed.push(savedPath), (message) => errors.push(message));
     }
@@ -139,8 +189,8 @@ describe("sync metadata completion barrier", () => {
     expect(db.query("SELECT parse_status FROM files WHERE id=1").get()).toEqual({ parse_status: "quality" });
     expect(useParseStore.getState().statuses[path]).toBe("quality");
     expect(useParseStore.getState().jobs[path]).toBeUndefined();
-    expect(usePipelineStore.getState().items[path].quality).toBe("done");
-    expect(usePipelineStore.getState().items[path].embed).toBe("done");
+    expect(usePipelineStore.getState().items[path].parse).toBe("done");
+    expect(usePipelineStore.getState().items[path].embed).toBe("pending");
     expect(parsed).toEqual([path]);
     expect(errors).toEqual([]);
     expect(queue.takeFailure(7)).toBeNull();
@@ -158,7 +208,7 @@ describe("sync metadata completion barrier", () => {
     expect(saved).toBe(false);
     expect(parsed).toEqual([]);
     expect(useParseStore.getState().statuses[path]).toBe("error");
-    expect(usePipelineStore.getState().items[path].quality).toBe("error");
+    expect(usePipelineStore.getState().items[path].parse).toBe("error");
     expect(errors[0]).toContain("no such table");
     expect(queue.takeFailure(7)).toContain("no such table");
   });

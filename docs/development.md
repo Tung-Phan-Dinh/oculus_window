@@ -1,7 +1,7 @@
 # Development
 
 For this Windows checkout, begin with [windows.md](./windows.md). Use Bun,
-Rust MSVC, Visual Studio C++ Build Tools + Windows SDK, sccache and uv. The
+Rust MSVC, Visual Studio C++ Build Tools + Windows SDK and sccache. The
 Windows config is merged automatically by Tauri. macOS notes below describe
 the upstream build.
 
@@ -9,7 +9,6 @@ the upstream build.
 
 - **bun** (never npm/yarn/pnpm — see root `CLAUDE.md`)
 - Rust toolchain (stable, via rustup)
-- **uv** for the sidecar's Python environment
 - macOS is the primary target (keep-alive, screenshots, and the WebView
   behaviour notes are macOS-specific)
 
@@ -18,25 +17,94 @@ the upstream build.
 ```sh
 cd app
 bun install
-bun run ffmpeg        # fetches the ffmpeg binary into src-tauri/binaries/
-bun run prepare-sidecar # stages Windows sources and uv
-bun run stage-cli     # required once before a clean tauri dev
-cd ../sidecar
-uv sync               # creates .venv (~1.2GB — that is the floor, mostly torch)
+bun run predev        # deps, ffmpeg, libpdfium and the `oculus` CLI
 ```
+
+`predev` is the whole preflight and it is idempotent — run it any time. It is
+also bun's lifecycle name for `dev`, so `bun run dev` runs it first and so does
+`bun run tauri dev`, whose `beforeDevCommand` is now just
+`node scripts/dev.mjs`. That wrapper sets `OCULUS_CLI_WATCH=1` through the
+child environment on both Windows and Unix. `OCULUS_SKIP_PREDEV=1` skips the
+preflight when you only want vite.
+
+**There is no Python step any more**, and no `sidecar/` directory: it left the
+tree in `f875bb1`, which is the commit the separate local-server repo forks
+from. If you have an orphaned `sidecar/.venv` from an older checkout it is
+an unused environment retained on disk; it is not packaged or started.
+
+The two fetch steps (`bun run ffmpeg`, `bun run pdfium`) are still there to run
+on their own, and `beforeBuildCommand` calls them directly; they are worth
+knowing about because a `cargo test` or a `bun run cli` on a fresh checkout
+does not go through Tauri or through `predev`.
+
+`libpdfium` is the page rasterizer behind `app/src-tauri/src/embed/raster.rs` —
+a native C++ library with no crates.io source, so `app/scripts/fetch-pdfium.mjs`
+downloads a prebuilt one from bblanchon/pdfium-binaries. Its release tag is
+pinned to the Chromium revision `pdfium-render`'s feature flag binds against: a
+lib from another revision fails at *bind* time, not at compile time, so the two
+move together. Neither binary is committed — `app/src-tauri/binaries/` is
+gitignored. At runtime the library is found relative to the executable
+(`pdfium.dll` beside the Windows executable, `Contents/Frameworks/` in a
+macOS bundle, an ancestor `binaries/` in dev),
+and `OCULUS_PDFIUM_LIB` overrides that with an explicit path.
 
 ## Running
 
 ```sh
 cd app
-bun run tauri dev     # full desktop app (spawns the sidecar itself)
+bun run tauri dev     # full desktop app
 bun run dev           # vite only, browser — no Tauri APIs, limited use
 bun run tauri build   # release build
-bun run cli           # build the headless `oculus` binary
-bun run cli:install   # + copy on Windows / symlink on Unix into ~/.local/bin
+bun run predev        # the dev preflight, by hand
+bun run cli           # build the headless `oculus` binary (release)
+bun run cli:dev       # the same binary in the debug profile
+bun run cli:install   # release build + copy on Windows / symlink on Unix to ~/.local/bin
 bun run stage-cli     # build it and stage it as a sidecar for the bundle
 bun run docs:cli      # regenerate docs/cli-reference.md from the binary's help
 ```
+
+### The dev CLI
+
+The `oculus` CLI is a second binary in the same crate, and for a long time
+nothing in the dev path built it. `tauri dev` issues a bare `cargo run`, which
+builds `app` and no other bin target; `bun run cli` builds the *release* one by
+hand. So `target/debug/oculus` was whatever a stray `cargo test` last left
+there — measured once at ten days and several subcommands out of date — while
+being the sibling of the running app and therefore the first `oculus` on a
+coding agent's PATH (`child_env` in
+`app/src-tauri/src/harness/discover.rs`). The agent ran `oculus project create`
+and got `unrecognized subcommand` from a binary that looked entirely
+legitimate.
+
+Three things close that, and they are worth knowing separately because they
+cover different windows:
+
+- **`app/scripts/predev.mjs`** builds it at the start of every dev session.
+  Debug, not release: the dev app runs out of `target/debug`, so those
+  artifacts are already warm and the build is ~25s after a Rust change and ~3s
+  when nothing moved. A release CLI in front of every dev start would be a
+  minute spent optimising a binary the session does not use.
+- **`app/scripts/watch-cli.mjs`** keeps it current *through* a session.
+  `tauri dev` re-runs cargo and relaunches the app on a Rust change but never
+  re-runs `beforeDevCommand`, so without this the CLI drifts back to the
+  vintage of whenever the session began. It deliberately loses the race: its
+  debounce is longer than tauri's, so the app's build takes cargo's package
+  lock first and the dev loop keeps the latency it had. Started detached by
+  `predev` when `OCULUS_CLI_WATCH=1`, and it ends itself when the vite port
+  stops answering.
+- **`discover::warn_if_stale`** says so in the dev terminal if a CLI under
+  `target/` is older than the `.rs` files beside it. It should never fire; it
+  exists because the failure is invisible from the agent's end, where a stale
+  binary runs, answers `--version`, and rejects a subcommand it has never heard
+  of. A binary from anywhere else — a bundle's sidecar, `~/.local/bin`, the
+  PATH — has no sources to be behind, so it is silent by construction.
+
+Both `predev` and the watcher delete the binary before building. Cargo reports
+"Finished" while leaving the previous one in place when it decides the uplift
+from `target/debug/deps` is unnecessary, which is the exact failure the
+preflight exists to prevent. The cost is a few seconds after each edit with no
+`oculus` at that path at all — which is the right way round, and is why
+`oculus_cli` ranks the candidates it finds instead of trusting one.
 
 `tauri build` runs `stage-cli` for you (it is in `beforeBuildCommand`): the
 `oculus` CLI ships inside the app because the macOS keep-alive LaunchAgent runs
@@ -46,60 +114,48 @@ step writes a placeholder on a cold build.
 
 `docs:cli` follows `stage-cli` in the same hook, which is the only reason it is
 cheap: the release binary is already built and current, so regenerating
-[cli-reference.md](./cli-reference.md) is one process launch. It is not on
-`beforeDevCommand` — `tauri dev` never builds the CLI, so hooking it there
-would put a release build in front of every dev start. Run it by hand after
-changing the CLI if you want the repo copy current before the next bundle.
-
-The sidecar can also be run by hand (`cd sidecar && uv run main.py`) for
-debugging — keep Oculus off port 9547 via the env override documented at the
-top of `app/src-tauri/src/sidecar.rs`, and remember stdout is block-buffered
-(`docs/sidecar.md`).
+[cli-reference.md](./cli-reference.md) is one process launch. `predev` runs it
+too, against the debug binary it has just built, and the generator only writes
+when the help actually changed — so the reference moves in the same commit as
+the CLI rather than waiting for the next bundle.
 
 ## Checks
 
 - Frontend type-check + bundle: `cd app && bun run build` (runs `tsc`).
 - Rust: `cargo check` in `app/src-tauri` (or just let `tauri dev` rebuild).
 - Retrieval smoke test: `app/src-tauri/src/bin/retrieval_smoke.rs`.
-- Sidecar regressions: `cd sidecar && uv run python -m unittest discover`.
-  The balloon test allocates a small synthetic worker and verifies kill and
-  restart without loading models or contacting MinerU.
-- Real quality regression: `cd sidecar && uv run python benchmark_quality.py
-  /path/to/deck.pdf --memory-cap 8192`. It copies the source to a temporary
-  directory, performs fast + local quality, and reports whole-tree peak and
-  kills. It needs cached/downloadable MinerU weights and can take minutes.
+- Parse regressions: `cargo test` in `app/src-tauri`. The differential tests in
+  `parse/mineru/render.rs` pin the Python renderer's own output and are now the
+  only record of what it did; none of them touch the network.
+- Real parse regression: the golden fixtures in `data/parse-fixtures/`
+  (gitignored) — see [parsing.md](./parsing.md#debugging).
 - After UI changes, screenshot the running app (root `CLAUDE.md` has the
   incantation) — the WebView is where layout bugs actually show.
 
-## How it connects
-
-The Rust supervisor passes the persisted parse settings to the sidecar at
-spawn. A standalone sidecar can use these environment variables instead:
+## Environment overrides
 
 | Variable | Meaning |
 | --- | --- |
-| `OCULUS_SIDECAR_EXTERNAL` | Tell the app not to spawn/reclaim the sidecar |
-| `OCULUS_SIDECAR_MEMORY_CAP_MB` | Whole-tree cap, default 8192, floor 5120 |
-| `OCULUS_MINERU_BACKEND` | `local` (default), `cloud`, or `auto` |
-| `OCULUS_DATA_DIR` | Directory containing the persistent cloud usage ledger |
-| `OCULUS_MINERU_WINDOW_PAGES` | Lower the local rendered-page window; hard maximum 8 |
-| `OCULUS_MINERU_CHUNK_PAGES` | Lower the outer progress chunk; maximum 64 |
-| `OCULUS_MEMORY_SAMPLE_SECONDS` | Watchdog cadence, default 1 second (profiling/tests) |
+| `OCULUS_DATA_DIR` | The data directory, including both cloud usage ledgers |
+| `OCULUS_PDFIUM_LIB` | Explicit path to `libpdfium`, instead of the search relative to the executable |
 
-Changing the cap live uses `/limits`, so it can terminate a worker if its
-current footprint exceeds the new budget. Cloud tokens are **not** environment
-settings: Rust retrieves them from the keychain for the loopback parse request.
-Cloud development does not require enabling uploads; protocol/routing tests
-mock external calls. See [sidecar.md](./sidecar.md) for privacy and API limits.
+Which parser and which embedder run is a **setting, not an environment
+variable** — the `parse` and `embed` rows in SQLite, written from Settings →
+Library. Neither cloud's credential is an environment variable either: both
+come from the keychain and are handed straight to an in-process client, so
+neither crosses a socket on this machine. Working on either protocol needs no
+real key — the client tests run against a fake server. See
+[parsing.md](./parsing.md) and [retrieval.md](./retrieval.md) for privacy and
+API limits.
 
 ## Gotchas
 
 - `tauri dev` rebuilds SIGTERM the app in a way that bypasses Tauri's Exit
-  event; the sidecar supervisor installs its own handlers, so orphaned
-  uvicorns should not happen — if one does, the next launch reclaims the
-  port.
+  event. Nothing the app spawns outlives it any more — the one long-lived
+  child process was the sidecar — but a CLI-agent subprocess mid-turn is the
+  case to watch (see [harness.md](./harness.md)).
 - User data lives in `~/Library/Application Support/com.tchan.oculus`
   (cookie, `oculus.db`, `courses/`, `lectures/`). Deleting it is a full
   reset, including auth.
-- `data/`, `*.db`, `sidecar/.venv/`, `app/src-tauri/binaries/` are
-  gitignored; never commit them.
+- `data/`, `*.db` and `app/src-tauri/binaries/` are gitignored; never commit
+  them.

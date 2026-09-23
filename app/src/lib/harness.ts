@@ -10,22 +10,17 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getDb, getSetting } from "@/lib/db";
 import { isWindows } from "@/lib/platform";
+import { filterOffered, loadCatalogue } from "@/lib/opencodeCatalogue";
 
-export type Provider = "claude" | "codex";
+export type Provider = "claude" | "codex" | "opencode" | "antigravity";
 
-export const PROVIDERS: { id: Provider; label: string }[] = [
-  {
-    id: "claude",
-    label: isWindows ? "Claude Code via WSL2" : "Claude Code",
-  },
-  { id: "codex", label: "Codex" },
-];
-
-/** The reasoning levels a turn may ask for. `claude --effort` takes exactly
- *  these; Codex declares its own per model (`CodexModel.reasoningEfforts`),
- *  which is why the picker reads the level list off the *model*, not the
- *  provider. `null` is the absence of a level — the flag is left off and the
- *  agent's own default applies. Labels are bb's. */
+/** The reasoning levels a turn may ask for, **weakest first** — the key order
+ *  here is the canonical one, and `sortReasoning` below is the only thing that
+ *  decides how a level row reads. `claude --effort` takes exactly these; Codex
+ *  declares its own per model (`CodexModel.reasoningEfforts`), which is why
+ *  the picker reads the level list off the *model*, not the provider. `null`
+ *  is the absence of a level — the flag is left off and the agent's own
+ *  default applies. Labels are bb's. */
 export const REASONING_LABELS: Record<string, string> = {
   none: "None",
   minimal: "Minimal",
@@ -39,6 +34,33 @@ export const REASONING_LABELS: Record<string, string> = {
 
 export function reasoningLabel(level: string): string {
   return REASONING_LABELS[level] ?? level;
+}
+
+/** Weakest to strongest, from the key order of `REASONING_LABELS` so there is
+ *  one table rather than two that can drift. */
+const REASONING_ORDER = Object.keys(REASONING_LABELS);
+
+/**
+ * A model's levels in the one order a person expects to read them.
+ *
+ * **No provider hands them over sorted, and one of them hands them over
+ * alphabetically.** opencode's catalogue spells `variants` as an object keyed
+ * by level id, and a JSON map has no order worth keeping, so the levels
+ * arrived as High · Low · Max — which reads like a ranking and is not one.
+ * Sorting here rather than at each source covers all three catalogues,
+ * including a Codex that adds a level to an existing model tomorrow.
+ *
+ * A level this build has no name for keeps its place at the end, in the order
+ * the provider gave it: an unknown id is already shown verbatim by
+ * `reasoningLabel`, and guessing where it ranks would be worse than tacking
+ * it on.
+ */
+export function sortReasoning(levels: string[]): string[] {
+  const rank = (l: string) => {
+    const i = REASONING_ORDER.indexOf(l);
+    return i === -1 ? REASONING_ORDER.length : i;
+  };
+  return [...levels].sort((a, b) => rank(a) - rank(b));
 }
 
 /** One row of the model picker: the id the CLI is given, the name a person
@@ -56,6 +78,12 @@ export interface HarnessModel {
   /** Where the composer starts before anyone has picked. Not a "default
    *  model" the user can select — every turn names its model outright. */
   isDefault?: boolean;
+  /** What the provider says this model can do, for opencode's rows only —
+   *  Claude's and Codex's lists carry none of these, and absent reads as
+   *  capable. `unusableReason` in `@/lib/opencodeCatalogue` is the rule. */
+  toolCall?: boolean;
+  textInput?: boolean;
+  textOutput?: boolean;
 }
 
 /** The model and level a fresh composer opens on. Nothing is ever sent
@@ -120,6 +148,147 @@ export const CLAUDE_MODELS: HarnessModel[] = [
   },
 ];
 
+/** One CLI agent the harness can drive: its id, the name a person reads, and
+ *  where its catalogue comes from. */
+export interface ProviderInfo {
+  id: Provider;
+  label: string;
+  /** The models this provider has without being asked. Claude Code answers no
+   *  model-list call over `stream-json`, so its catalogue is compiled in
+   *  above; `null` says the CLI has to be asked, which is what
+   *  `fetchModels` below does. Everything that used to test
+   *  `provider === "claude"` — the composer's opening selection, what a
+   *  provider switch clears — is really asking this question. */
+  staticModels: HarnessModel[] | null;
+  /** Ask the CLI for its catalogue. Present exactly when `staticModels` is
+   *  null, and already adapted to the picker's shape, so a call site never
+   *  names a provider to know which command to invoke
+   *  (`useProviderModels` in `app/src/hooks/useProviderModels.ts`). */
+  fetchModels?: () => Promise<HarnessModel[]>;
+  /** How this CLI's own sign-in ends — the one thing `SignInDialog` branches
+   *  on, and a property of the provider rather than a test on its id.
+   *
+   *  `"code"` is Claude: `claude auth login` prints the authorize URL and then
+   *  *blocks reading a pasted authorization code off stdin*, so the dialog has
+   *  to offer a field. `"callback"` is Codex: `codex login` runs a loopback
+   *  server on :1455 and finishes by itself when the browser comes back, so
+   *  there is nothing to type and the dialog only waits.
+   *
+   *  `null` is opencode, and it is a decision rather than a gap. opencode's
+   *  credentials are per *provider*, not per CLI, and Settings → AI already
+   *  owns that whole surface — the catalogue, the form specs, the OAuth flows
+   *  (`OpencodeProvidersSection.tsx`). A second path to the same store would
+   *  be a second answer to "am I signed in", so `harness_sign_in_start`
+   *  rejects opencode and `harness_sign_in_status` answers `signedIn: null`. */
+  signIn: "code" | "callback" | null;
+  /** What a picker should say when this provider's list comes back empty and
+   *  its CLI *is* installed — the one case "No models available" is a dead end
+   *  rather than a fact, because there is something the student can do about
+   *  it.
+   *
+   *  opencode's list is filtered by the catalogue below, so an installed,
+   *  connected opencode with nothing probed yet legitimately has zero rows,
+   *  and the sentence has to point at where the probing happens. Claude and
+   *  Codex leave this unset: an empty catalogue from either of them is an
+   *  answer their CLI gave, not a step that was skipped.
+   *
+   *  It is a field here rather than an `id === "opencode"` in the picker for
+   *  the same reason `staticModels`, `signIn` and `health` are: this file is
+   *  the one place a provider is declared, and the picker stays provider-blind
+   *  so a fourth agent costs it nothing. */
+  emptyNote?: string;
+}
+
+/**
+ * Every provider, in the order the picker lists them. **The one place a
+ * provider is declared**: the marks (`ProviderMark.tsx`), the picker's rows,
+ * the job registry's read in `db.ts` and the composer's selection all come off
+ * this list rather than off a hardcoded pair, so adding a fourth agent is an
+ * entry here plus its mark.
+ *
+ * opencode brands itself lowercase, so the label is not title-cased.
+ */
+export const PROVIDERS: ProviderInfo[] = [
+  { id: "claude", label: isWindows ? "Claude Code via WSL2" : "Claude Code", staticModels: CLAUDE_MODELS, signIn: "code" },
+  {
+    id: "codex",
+    label: "Codex",
+    staticModels: null,
+    fetchModels: () => harnessCodexModels().then(codexAsModels),
+    signIn: "callback",
+  },
+  {
+    id: "opencode",
+    label: "opencode",
+    staticModels: null,
+    // opencode is the one provider whose catalogue is bigger than its truth:
+    // 218 providers' worth of rows, some of which answer 400 or 401 when
+    // asked (`app/src/lib/opencodeCatalogue.ts`). The filter lives inside the
+    // entry so `useProviderModels` and `ModelPicker` still name no provider —
+    // "fetch the list" and "fetch the list that works" are the same job from
+    // where they stand.
+    fetchModels: async () => {
+      const models = opencodeAsModels(await harnessOpencodeModels());
+      return filterOffered(models, await loadCatalogue());
+    },
+    signIn: null,
+    emptyNote: "Sign in to a provider in Settings → AI to get models here.",
+  },
+  {
+    id: "antigravity",
+    label: "Antigravity",
+    staticModels: null,
+    // `agy models` prints what the account can actually use, and costs
+    // nothing to ask — it is a listing subcommand, not a turn. No filter in
+    // front of it: unlike opencode's 218 providers, this catalogue is one
+    // account's own entitlements, so a row in it is a row that works.
+    fetchModels: () => harnessAntigravityModels().then(antigravityAsModels),
+    // Not "no sign-in" so much as "no sign-in to drive". `agy` has no login
+    // subcommand: it reads the system keyring on every run and, finding
+    // nothing, opens Google Sign-In in the browser itself. So the flow exists
+    // — it is just the CLI's, triggered by the first message, and there is
+    // nothing for `SignInDialog` to wait on or type into.
+    signIn: null,
+    emptyNote:
+      "Send a message to finish Antigravity's Google sign-in, then its models appear here.",
+  },
+];
+
+export function providerInfo(provider: Provider): ProviderInfo | undefined {
+  return PROVIDERS.find((p) => p.id === provider);
+}
+
+export function providerLabel(provider: Provider): string {
+  return providerInfo(provider)?.label ?? provider;
+}
+
+/** Which sign-in shape this agent has, or null for one that has none here.
+ *  Read off `PROVIDERS` rather than tested on an id, so a fourth agent costs
+ *  the dialog nothing. */
+export function signInFlow(provider: Provider): "code" | "callback" | null {
+  return providerInfo(provider)?.signIn ?? null;
+}
+
+/** Narrow a string that came out of the database — or out of an older build —
+ *  to a provider. Driven off `PROVIDERS` so it can never go stale against the
+ *  union: a stored row naming a provider this build has is kept, and one
+ *  naming a provider it does not is dropped. */
+export function isProvider(value: unknown): value is Provider {
+  return typeof value === "string" && PROVIDERS.some((p) => p.id === value);
+}
+
+/** The selection a fresh composer opens on for one provider. A provider whose
+ *  catalogue is fetched has nothing to open on until its CLI answers — the
+ *  picker fills it in the moment the list lands — so the answer there is an
+ *  empty selection rather than a guess. */
+export function defaultSelectionFor(provider: Provider): {
+  model: string | null;
+  reasoning: string | null;
+} {
+  const models = providerInfo(provider)?.staticModels;
+  return models ? defaultSelection(models) : { model: null, reasoning: null };
+}
+
 export type ToolKind =
   | "read" | "edit" | "write" | "bash" | "search" | "oculus_cli"
   | "task" | "web" | "plan" | "other";
@@ -132,7 +301,12 @@ export type ToolKind =
  * (docs/chapters.md), and two tables would drift into two vocabularies for one
  * `ToolKind`.
  */
-export function toolVerb(kind: ToolKind, done: boolean): string {
+export function toolVerb(kind: ToolKind, done: boolean, name?: string | null): string {
+  // The one kind two tools share: a search and a fetch are both `web`, and
+  // "Fetched" over a list of queries reads as the wrong thing having happened.
+  // The provider's own tool name is the only thing that tells them apart, and
+  // every row carries it (`name` in `ToolMeta`).
+  if (kind === "web" && name && /search/i.test(name)) return done ? "Searched" : "Searching";
   switch (kind) {
     case "read": return done ? "Read" : "Reading";
     case "edit": return done ? "Edited" : "Editing";
@@ -169,7 +343,7 @@ export type HarnessEvent =
   | { type: "thinking"; text: string }
   | { type: "tool_started"; id: string; kind: ToolKind; name: string; title: string; input: unknown }
   | { type: "tool_output_delta"; id: string; text: string }
-  | { type: "tool_finished"; id: string; ok: boolean; output: string }
+  | { type: "tool_finished"; id: string; ok: boolean; output: string; title?: string | null }
   | { type: "usage"; input_tokens: number; output_tokens: number; context_tokens: number | null; context_window: number | null; cost_usd: number | null }
   | { type: "rate_limits"; windows: RateWindow[] }
   | { type: "thread_titled"; title: string }
@@ -188,7 +362,13 @@ export type HarnessEvent =
    *  it still holds the original, and the timeline says so. */
   | { type: "rewound"; from_item_id: number; context: boolean }
   | { type: "turn_finished"; status: "completed" | "interrupted" | "failed" }
-  | { type: "error"; message: string }
+  /** `auth` names the provider when the message is that CLI saying it has no
+   *  usable credentials — an expired OAuth session, a login never done. It is
+   *  the difference between a crash and a state the student can fix, so the
+   *  timeline draws a sign-in card rather than a red row for it. Rust writes
+   *  the same fact to the row's `meta` (`{"auth":"claude"}`), which is what
+   *  `parseErrorMeta` reads after a reload. */
+  | { type: "error"; message: string; auth: Provider | null }
   | { type: "exited"; code: number | null };
 
 export interface HarnessEnvelope {
@@ -245,6 +425,13 @@ export interface QueuedMessage {
   text: string;
 }
 
+/** What an `error` row's `meta` can carry. Only the one field, and only on
+ *  the rows that have it: an error that is not a credentials failure has no
+ *  `meta` at all. */
+export interface ErrorMeta {
+  auth?: Provider;
+}
+
 export interface ToolMeta {
   kind?: ToolKind;
   name?: string;
@@ -289,10 +476,80 @@ export function codexAsModels(models: CodexModel[]): HarnessModel[] {
     id: m.id,
     label: m.displayName,
     description: m.description,
-    reasoningEfforts: m.reasoningEfforts,
+    reasoningEfforts: sortReasoning(m.reasoningEfforts),
     defaultReasoningEffort: m.defaultReasoningEffort,
     isDefault: m.isDefault,
   }));
+}
+
+/**
+ * One row of `opencode models`. The id is that CLI's own spelling,
+ * `providerID/id` (`anthropic/claude-sonnet-4-5`) — free-form, and passed back
+ * to the CLI untouched, so nothing here parses or prettifies it.
+ *
+ * opencode calls a model's reasoning levels its **variants**; they are the
+ * same thing `claude --effort` and Codex's `reasoningEfforts` name, so the
+ * adapter below maps them onto the one field the picker reads. Everything but
+ * the id and the name is optional on the way in, the way `getJobModels` is
+ * tolerant of a stored row: a bridge that reports no variants for a model
+ * costs that model its level row, not the list its rows.
+ */
+/** One row of `agy models`. Antigravity bakes the reasoning level into most
+ *  of its slugs (`gemini-3.8-flash-high`), so the list it returns declares no
+ *  efforts and the picker offers none beside them — a level chosen next to a
+ *  slug that already names one could only contradict it. */
+export interface AntigravityModel {
+  id: string;
+  displayName: string;
+  reasoningEfforts: string[];
+  defaultReasoningEffort: string | null;
+}
+
+export function antigravityAsModels(models: AntigravityModel[]): HarnessModel[] {
+  return models.map((m) => ({
+    id: m.id,
+    label: m.displayName || m.id,
+    // `agy models` prints a slug and, sometimes, prose beside it. The prose
+    // is not a description of the model so much as a note about the row, and
+    // the bridge does not carry it across — an empty string is what every
+    // other provider's description field degrades to anyway.
+    description: "",
+    reasoningEfforts: sortReasoning(m.reasoningEfforts),
+    defaultReasoningEffort: m.defaultReasoningEffort,
+  }));
+}
+
+export interface OpencodeModel {
+  id: string;
+  displayName: string;
+  description?: string;
+  variants?: string[];
+  defaultVariant?: string | null;
+  isDefault?: boolean;
+  /** `ModelInfo` in `app/src-tauri/src/harness/opencode.rs` always sends
+   *  these three; optional here so an older payload still parses. */
+  toolCall?: boolean;
+  textInput?: boolean;
+  textOutput?: boolean;
+}
+
+/** `opencode models` in the shape `CLAUDE_MODELS` has, so the picker renders
+ *  all three catalogues without a special case. */
+export function opencodeAsModels(models: OpencodeModel[]): HarnessModel[] {
+  return models.map((m) => {
+    const variants = sortReasoning(m.variants ?? []);
+    return {
+      id: m.id,
+      label: m.displayName || m.id,
+      description: m.description ?? "",
+      reasoningEfforts: variants,
+      defaultReasoningEffort: m.defaultVariant ?? variants[0] ?? null,
+      isDefault: m.isDefault ?? false,
+      toolCall: m.toolCall,
+      textInput: m.textInput,
+      textOutput: m.textOutput,
+    };
+  });
 }
 
 export function parseUsage(t: HarnessThread | null): ThreadUsage | null {
@@ -342,6 +599,30 @@ export function messageAt(item: HarnessItem): number | null {
     return typeof at === "number" ? at : null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Which agent an error row is about, when the error was that agent saying it
+ * has no credentials — and null for every other error.
+ *
+ * Rust puts it on the row (`{"auth":"claude"}`) as well as on the event, so a
+ * reloaded page draws the same card rather than a thread whose one actionable
+ * row quietly became a red line again. `isProvider` narrows it, so a row
+ * naming an agent this build does not have reads as an ordinary error instead
+ * of an unreachable button.
+ *
+ * No cache, on `messageAt`'s precedent rather than `parseToolMeta`'s: that one
+ * exists because a single tool row can carry 300KB of output, where this is
+ * one short field on a memoised row.
+ */
+export function parseErrorMeta(item: HarnessItem): ErrorMeta {
+  if (!item.meta) return {};
+  try {
+    const auth = (JSON.parse(item.meta) as { auth?: unknown }).auth;
+    return isProvider(auth) ? { auth } : {};
+  } catch {
+    return {};
   }
 }
 
@@ -399,8 +680,8 @@ export interface SendOptions {
    *  lecture's row, so `subjectId` is not consulted alongside it. */
   lectureId?: string | null;
   /** The moment, built by the player at send time: the timestamp, the last
-   *  minute of transcript, the chapter, and the frame path from
-   *  `lectureGrabFrame`. It is appended to the prompt the CLI receives, after
+   *  minute of transcript, the chapter, and a frame path per downloaded
+   *  stream from `lectureGrabFrames`. It is appended to the prompt the CLI receives, after
    *  the student's text — it never becomes the message's content, so the
    *  timeline still shows only what was typed. */
   context?: string | null;
@@ -475,8 +756,16 @@ export function harnessDeleteThread(threadId: number): Promise<void> {
   return invoke("harness_delete_thread", { threadId });
 }
 
-export function harnessHealth(): Promise<BridgeHealth[]> {
-  return invoke<BridgeHealth[]>("harness_health");
+/**
+ * Where each CLI is, or why it is not. Read through
+ * `app/src/hooks/useBridgeHealth.ts` rather than called directly — every model
+ * picker in the app asks this question and there is one answer per session.
+ *
+ * `recheck` drops Rust's cached lookups first, which can cost a login shell
+ * per provider; it belongs to Settings' *Recheck* button and nothing else.
+ */
+export function harnessHealth(recheck = false): Promise<BridgeHealth[]> {
+  return invoke<BridgeHealth[]>("harness_health", { recheck });
 }
 
 /** Ask the provider for its plan windows now, rather than waiting for a turn
@@ -487,6 +776,74 @@ export function harnessRefreshRateLimits(provider: Provider): Promise<void> {
   return invoke<void>("harness_refresh_rate_limits", { provider });
 }
 
+/**
+ * Whether the CLI thinks it is signed in, and as whom.
+ *
+ * Three fields rather than one boolean because they are three different
+ * answers. `signedIn: null` is "not answerable from here" — opencode, whose
+ * store is per provider and whose surface is Settings → AI — and is not the
+ * same as signed out. `error` is the probe itself failing (no binary, a spawn
+ * that would not start), which is not evidence either way.
+ *
+ * Read through `app/src/hooks/useSignInStatus.ts` rather than called directly:
+ * Rust spawns the CLI per ask and caches nothing, so the frontend cache is the
+ * only one there is.
+ */
+export interface SignInStatus {
+  provider: Provider;
+  signedIn: boolean | null;
+  /** Which account the CLI is on — an email where it names one, else the
+   *  door it went through ("Claude subscription", "ChatGPT"). */
+  account: string | null;
+  error: string | null;
+}
+
+/** One line of a running sign-in, or the last event of the run. Same shape as
+ *  the install stream next door, plus the authorize URL. */
+export const SIGNIN_EVENT = "harness-signin";
+
+export interface SignInLine {
+  provider: Provider;
+  line: string | null;
+  /** Emitted once, on the first line that carries one. Rust opens it in the
+   *  system browser itself; it rides the event anyway so the dialog can show
+   *  it with a Copy, because an `open` that silently failed must not be a
+   *  dead end. */
+  url: string | null;
+  done: boolean;
+  ok: boolean | null;
+  status: string | null;
+}
+
+export function harnessSignInStatus(provider: Provider): Promise<SignInStatus> {
+  return invoke<SignInStatus>("harness_sign_in_status", { provider });
+}
+
+/** Run the CLI's own login. Output arrives on `SIGNIN_EVENT` until a line
+ *  carries `done`; nothing is returned here because the run outlives the call.
+ *  Rejects for opencode — see `ProviderInfo.signIn`. */
+export function harnessSignInStart(provider: Provider): Promise<void> {
+  return invoke("harness_sign_in_start", { provider });
+}
+
+/** The authorization code the student pasted back. Only Claude's flow asks
+ *  for one: `claude auth login` blocks on stdin until it arrives. */
+export function harnessSignInCode(provider: Provider, code: string): Promise<void> {
+  return invoke("harness_sign_in_code", { provider, code });
+}
+
+export function harnessSignInCancel(provider: Provider): Promise<void> {
+  return invoke("harness_sign_in_cancel", { provider });
+}
+
+export function harnessAntigravityModels(): Promise<AntigravityModel[]> {
+  return invoke<AntigravityModel[]>("harness_antigravity_models");
+}
+
 export function harnessCodexModels(): Promise<CodexModel[]> {
   return invoke<CodexModel[]>("harness_codex_models");
+}
+
+export function harnessOpencodeModels(): Promise<OpencodeModel[]> {
+  return invoke<OpencodeModel[]>("harness_opencode_models");
 }

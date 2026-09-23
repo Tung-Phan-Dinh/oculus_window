@@ -1,4 +1,3 @@
-pub mod agent;
 pub mod agents;
 mod auth;
 pub mod browser;
@@ -10,36 +9,33 @@ pub mod echo360;
 pub mod ed;
 mod files;
 pub mod harness;
-mod ipc;
 pub mod keepalive;
 mod lectures;
-pub mod llm;
 pub mod md;
 pub mod menu;
 pub mod okta;
 mod media;
 pub mod mineru;
+pub mod parse;
 pub mod paths;
 pub mod platform;
-mod python_runtime;
 pub mod projects;
-pub mod recap;
+pub mod reading;
 pub mod retrieval;
 mod scrape;
 pub mod store;
 pub mod sync;
 pub mod terms;
-pub mod sidecar;
 mod storage;
 mod subjects;
+pub mod embed;
+pub mod voyage;
 
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
 
 use auth::{auth_flag_path, saved_session_probe, AuthProbe, AuthState};
-use ipc::IpcPort;
 use lectures::Echo360Cache;
-use sidecar::SidecarProcess;
 use scrape::ScrapeCancel;
 use subjects::SubjectsState;
 
@@ -80,25 +76,22 @@ pub fn run() {
         .manage(SubjectsState(Arc::new(Mutex::new(vec![]))))
         .manage(Echo360Cache(Arc::new(Mutex::new(std::collections::HashMap::new()))))
         .manage(lectures::DownloadCancels::default())
-        .manage(SidecarProcess(Arc::new(Mutex::new(None))))
         .manage(ScrapeCancel::default())
-        .manage(agent::ChatCancel::default())
         .manage(browser::BrowserState::default())
         .setup(|app| {
-            // ── IPC HTTP server ────────────────────────────────────────
-            let port = ipc::start_ipc_server(app.handle().clone());
-            app.manage(IpcPort(port));
+            // ── Parse progress ─────────────────────────────────────────
+            // Parsing is in-process, so `parse-status` is emitted directly
+            // rather than posted back over a loopback port. This is the one
+            // place the parse path learns there is a window to emit to; a
+            // headless run never calls it and every emit is a no-op.
+            parse::events::bind(app.handle().clone());
+            // Same handshake for the embed seam — see `embed/events.rs`.
+            embed::events::bind(app.handle().clone());
 
             // ── Media HTTP server ──────────────────────────────────────
             // WebKit won't play <video> from the asset protocol (see
             // media.rs); lecture playback streams from here instead.
             app.manage(media::start_media_server(paths::data_dir()));
-
-            // ── Python parsing sidecar ─────────────────────────────────
-            sidecar::spawn(app.handle());
-            // Ctrl-C and the SIGTERM `tauri dev` sends on rebuild bypass
-            // Tauri's Exit event, so cleanup needs its own path.
-            sidecar::install_exit_handlers(app.handle());
 
             // ── Cleanup orphaned partial lecture downloads ──────────────
             lectures::cleanup_partial_downloads(app.handle());
@@ -116,9 +109,9 @@ pub fn run() {
             // A chaptering run killed mid-turn leaves `running` on the
             // lecture row; nothing else will ever clear it.
             chapters::app::reconcile(app.handle());
-            // Recap windows commit as they finish, but an interrupted run's
-            // `running` marker still needs the same startup repair.
-            recap::app::reconcile(app.handle());
+            // Reading-copy windows commit as they finish, but an interrupted
+            // run's `running` marker still needs the same startup repair.
+            reading::app::reconcile(app.handle());
             // ── Session restore on startup ──────────────────────────────
             // No WebView dance: we replay the persisted session cookie via a
             // server-side ureq ping. Valid → connected instantly. Rejected →
@@ -478,13 +471,22 @@ CREATE TABLE IF NOT EXISTS sync_schedules (
                         tauri_plugin_sql::Migration {
                             version: 16,
                             description: "llm usage ledger",
-                            // One row per model call, written by Rust (`llm.rs`)
-                            // right where the spending limit is enforced — the
-                            // sum over the current month is the budget check.
-                            // Soft refs only (chat_id has no FK): usage history
-                            // must survive a library reset (`clearAllFiles`)
-                            // and the chats table only arrives in a later
-                            // migration. cost_usd is NULL for local providers.
+                            // RETIRED FEATURE, LIVE MIGRATION. The BYOK API
+                            // layer this ledger belonged to was deleted; 16
+                            // and 17 stay because they already ran on every
+                            // existing database. `llm_usage` is created and
+                            // then left alone — nothing reads or writes it.
+                            // Bringing an API path back needs no new
+                            // migration; dropping these would need one.
+                            //
+                            // One row per model call, written by Rust right
+                            // where the spending limit was enforced — the sum
+                            // over the current month was the budget check.
+                            // Soft refs only (chat_id has no FK): usage
+                            // history had to survive a library reset
+                            // (`clearAllFiles`) and the chats table only
+                            // arrives in a later migration. cost_usd is NULL
+                            // for local providers.
                             sql: r#"
 CREATE TABLE IF NOT EXISTS llm_usage (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -505,12 +507,19 @@ CREATE INDEX IF NOT EXISTS idx_llm_usage_created ON llm_usage(created_at);
                         tauri_plugin_sql::Migration {
                             version: 17,
                             description: "chat conversations",
-                            // Written by Rust (`agent.rs`), not the frontend:
+                            // RETIRED FEATURE, LIVE MIGRATION — see 16. These
+                            // held the BYOK agent's conversations; chat is a
+                            // CLI agent now and keeps its own threads
+                            // (migrations 24–26, 28, 30). The tables are
+                            // created and then left alone.
+                            //
+                            // They were written by Rust, not the frontend:
                             // the loop's own tool-call and tool-result turns
-                            // are re-read on the next model turn, so the
-                            // history has to be authoritative where the loop
-                            // runs. `tool_calls`/`citations` are JSON blobs —
-                            // the OpenAI message shape round-trips unchanged.
+                            // were re-read on the next model turn, so the
+                            // history had to be authoritative where the loop
+                            // ran. `tool_calls`/`citations` are JSON blobs —
+                            // the OpenAI message shape round-tripped
+                            // unchanged.
                             sql: r#"
 CREATE TABLE IF NOT EXISTS chats (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1094,6 +1103,167 @@ ALTER TABLE projects ADD COLUMN event_id TEXT;
                         "#,
                             kind: tauri_plugin_sql::MigrationKind::Up,
                         },
+                        tauri_plugin_sql::Migration {
+                            version: 34,
+                            description: "lecture reading copy: the recap replaced by lines",
+                            // The recap (migration 31) is replaced, not
+                            // migrated: its notes were third-person summaries
+                            // per slide and the reading copy is a rewrite of
+                            // the transcript, one sentence per line. Nothing
+                            // in a recap row becomes a line, so the table is
+                            // dropped and the three status columns with it —
+                            // derived data, regenerable from the recording,
+                            // like `pages`. SQLite has dropped columns since
+                            // 3.35 and nothing indexes these three.
+                            //
+                            // `para` is derived in Rust from the slide
+                            // changes after a window validates (see
+                            // `reading::mark_paragraphs`), never asked of the
+                            // model. There is still no stored end: a line
+                            // lasts until the next starts.
+                            //
+                            // The job's model selection carries over: the
+                            // `job_models` settings row is rekeyed from
+                            // `lectureRecap` to `lectureReading` so a picked
+                            // model is not silently reset to the default.
+                            // Guarded by `json_valid` inside a CASE (which
+                            // short-circuits where a WHERE's AND need not):
+                            // `json_type` raises on malformed JSON, and the
+                            // registry read is tolerant of a bad row on
+                            // purpose — a migration must not be less so.
+                            sql: r#"
+DROP TABLE IF EXISTS lecture_recap;
+CREATE TABLE IF NOT EXISTS lecture_reading (
+    lecture_id    TEXT    NOT NULL REFERENCES lectures(id) ON DELETE CASCADE,
+    idx           INTEGER NOT NULL,
+    start_seconds INTEGER NOT NULL,
+    para          INTEGER NOT NULL DEFAULT 0,
+    text          TEXT    NOT NULL,
+    PRIMARY KEY (lecture_id, idx)
+);
+ALTER TABLE lectures DROP COLUMN recap_status;
+ALTER TABLE lectures DROP COLUMN recapped_at;
+ALTER TABLE lectures DROP COLUMN recap_error;
+ALTER TABLE lectures ADD COLUMN reading_status TEXT;
+ALTER TABLE lectures ADD COLUMN reading_written_at TEXT;
+ALTER TABLE lectures ADD COLUMN reading_error TEXT;
+UPDATE settings
+   SET value = json_set(json_remove(value, '$.lectureRecap'),
+                        '$.lectureReading', json_extract(value, '$.lectureRecap'))
+ WHERE key = 'job_models'
+   AND CASE WHEN json_valid(value) THEN json_type(value, '$.lectureRecap') END = 'object';
+                        "#,
+                            kind: tauri_plugin_sql::MigrationKind::Up,
+                        },
+                        tauri_plugin_sql::Migration {
+                            version: 35,
+                            description: "lexical page search: an FTS5 index over pages.markdown",
+                            // The words inside a document, searchable as you
+                            // type. Title search cannot see into a deck at
+                            // all, and the page-image embeddings answer a
+                            // *question*, not a keystroke — a cloud round trip
+                            // per search is not a field you type in. The SQL,
+                            // and the reasoning behind its triggers, live next
+                            // to the table they index:
+                            // `retrieval::PAGES_FTS_SQL`.
+                            sql: crate::retrieval::PAGES_FTS_SQL,
+                            kind: tauri_plugin_sql::MigrationKind::Up,
+                        },
+                        tauri_plugin_sql::Migration {
+                            version: 36,
+                            description: "in-app browser: visit history and cached site icons",
+                            // **One row per URL, not one per visit.** What the
+                            // address bar wants is "which page do you mean",
+                            // and that is answered by how often and how
+                            // recently a URL was opened — not by a log of
+                            // every time. A visit log would grow without
+                            // bound to answer a question nobody asks here,
+                            // and the history view in Settings groups by
+                            // `last_visit` either way, so a page revisited
+                            // today moves to today rather than appearing
+                            // twice.
+                            //
+                            // Icons are cached beside it because they are
+                            // fetched by *host* and wanted for hosts no tab
+                            // is on: a history row wants its icon as much as
+                            // an open tab does. `browser.rs` fetches them,
+                            // the frontend stores them, and a restart is the
+                            // only thing that asks the network again.
+                            sql: r#"
+CREATE TABLE IF NOT EXISTS browser_history (
+    id         INTEGER PRIMARY KEY,
+    url        TEXT    NOT NULL UNIQUE,
+    host       TEXT    NOT NULL,
+    title      TEXT    NOT NULL DEFAULT '',
+    visits     INTEGER NOT NULL DEFAULT 1,
+    last_visit TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_browser_history_recent
+    ON browser_history(last_visit DESC);
+
+CREATE TABLE IF NOT EXISTS browser_favicons (
+    host       TEXT PRIMARY KEY,
+    icon       TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+                        "#,
+                            kind: tauri_plugin_sql::MigrationKind::Up,
+                        },
+                        tauri_plugin_sql::Migration {
+                            version: 37,
+                            description: "project tasks: a task can belong to no project at all",
+                            // An unfiled task — something you have to do that
+                            // is not part of a piece of work yet. So
+                            // `project_tasks.project_id` becomes **nullable**,
+                            // and NULL means *no project*, the way
+                            // `projects.subject_id` NULL means no subject
+                            // (migration 27). Deliberately not an "Inbox"
+                            // project: a real row would need a board, a name,
+                            // a place in the index and a rule saying it cannot
+                            // be renamed or deleted, and every listing would
+                            // have to remember to leave it out.
+                            //
+                            // `project_id` cannot be ALTERed out of NOT NULL,
+                            // so the table is rebuilt — SQLite's 12-step
+                            // recipe, in the one shape that is safe inside a
+                            // migration's transaction. Three details carry it:
+                            //
+                            // - **`parent_id` self-references the table, and in
+                            //   the new one it must reference the *new* table.**
+                            //   That is the whole risk of this migration.
+                            //   Pointed at the table being replaced, the
+                            //   `DROP TABLE` fires the cascade — a drop
+                            //   performs an implicit delete of every row, and
+                            //   `defer_foreign_keys` defers the *check*, not
+                            //   the `ON DELETE CASCADE` action — and the copy
+                            //   is emptied of every subtask it had just made.
+                            //   Measured, not feared: the test flips that one
+                            //   table name and loses the rows.
+                            // - `PRAGMA foreign_keys = OFF` is not available
+                            //   here (it cannot take effect inside a
+                            //   transaction), so the copy runs under
+                            //   `defer_foreign_keys` and `ORDER BY id`, which a
+                            //   parent's id always satisfies — `create_tasks`
+                            //   writes a parent before the subtasks that name
+                            //   it. Belt and braces rather than one fix each:
+                            //   SQLite checks the copy's keys at the end of the
+                            //   single `INSERT … SELECT`, so either carries it
+                            //   alone. They are for the day the copy is split.
+                            // - the indexes are recreated, because dropping
+                            //   the old table drops them with it.
+                            //   `idx_project_tasks_project` stays exactly as it
+                            //   was: SQLite indexes NULLs, so "every unfiled
+                            //   task" is one seek like any other project's.
+                            //
+                            // The SQL lives beside the two writers it belongs
+                            // to (`crate::projects`) the way migration 35's
+                            // does, so the tests run the very string this
+                            // runs — including the trap about which table the
+                            // self-reference names.
+                            sql: crate::projects::UNFILED_TASKS_SQL,
+                            kind: tauri_plugin_sql::MigrationKind::Up,
+                        },
                     ],
                 )
                 .build(),
@@ -1134,19 +1304,36 @@ ALTER TABLE projects ADD COLUMN event_id TEXT;
             retrieval::embed_file,
             retrieval::search_pages,
             retrieval::embedding_stats,
-            llm::llm_set_api_key,
-            llm::llm_has_api_key,
-            llm::llm_delete_api_key,
-            llm::llm_list_models,
-            llm::llm_test_prompt,
-            llm::llm_usage_summary,
             mineru::mineru_set_api_key,
             mineru::mineru_has_api_key,
             mineru::mineru_delete_api_key,
-            agent::chat_send,
-            agent::chat_cancel,
+            embed::commands::embed_settings,
+            embed::commands::embed_set_engine,
+            embed::commands::embed_set_budget,
+            embed::commands::embed_blocked,
+            embed::commands::embed_estimate,
+            parse::commands::parse_settings,
+            parse::commands::parse_set_engine,
+            parse::commands::parse_set_engine_url,
+            parse::commands::parse_probe_local,
+            voyage::voyage_set_api_key,
+            voyage::voyage_has_api_key,
+            voyage::voyage_delete_api_key,
             harness::app::harness_health,
+            harness::app::harness_install_offer,
+            harness::app::harness_install_run,
+            harness::app::harness_sign_in_status,
+            harness::app::harness_sign_in_start,
+            harness::app::harness_sign_in_code,
+            harness::app::harness_sign_in_cancel,
             harness::app::harness_codex_models,
+            harness::app::harness_antigravity_models,
+            harness::app::harness_opencode_models,
+            harness::app::harness_opencode_providers,
+            harness::app::harness_opencode_set_key,
+            harness::app::harness_opencode_disconnect,
+            harness::app::harness_opencode_oauth_start,
+            harness::app::harness_opencode_oauth_finish,
             harness::app::harness_refresh_rate_limits,
             harness::app::harness_send,
             harness::app::harness_edit_resend,
@@ -1156,29 +1343,33 @@ ALTER TABLE projects ADD COLUMN event_id TEXT;
             harness::app::harness_edit_queued,
             harness::app::harness_interrupt,
             harness::app::harness_delete_thread,
+            harness::attach::harness_attach_image,
+            harness::attach::harness_attach_file,
             chapters::app::lecture_find_chapters,
-            chapters::app::lecture_grab_frame,
-            recap::app::lecture_write_recap,
-            sidecar::sidecar_health,
-            sidecar::sidecar_set_limits,
+            chapters::app::lecture_grab_frames,
+            reading::app::lecture_write_reading,
             storage::storage_report,
             browser::browser_open_url,
             browser::browser_state,
+            browser::browser_focus_main,
             browser::browser_place,
             browser::browser_set_viewport,
             browser::browser_hide_tab,
+            browser::browser_snapshot,
             browser::browser_hide,
             browser::browser_navigate,
             browser::browser_history,
             browser::browser_reload,
+            browser::browser_set_zoom,
+            browser::browser_find,
+            browser::browser_find_clear,
             browser::browser_close_tab,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
-            // Don't let uvicorn outlive the window.
+            // Don't let a CLI agent outlive the window.
             if matches!(event, tauri::RunEvent::Exit) {
-                sidecar::shutdown(app_handle);
                 harness::app::shutdown(app_handle);
             }
         });

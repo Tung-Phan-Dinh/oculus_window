@@ -40,7 +40,7 @@ fn validate_args(args: &[String]) -> Result<(), String> {
             _ => Err("This project command is not available through the Claude bridge.".into()),
         },
         "task" => match words.next() {
-            Some("list" | "add" | "update" | "move" | "rm" | "--help" | "-h") => Ok(()),
+            Some("list" | "add" | "update" | "move" | "refile" | "rm" | "--help" | "-h") => Ok(()),
             _ => Err("This task command is not available through the Claude bridge.".into()),
         },
         // Candidate detection is a bounded native media operation. The CLI
@@ -64,7 +64,7 @@ fn validate_args(args: &[String]) -> Result<(), String> {
             return Err("Pass task batches through --batch - in the Claude bridge.".into());
         }
     }
-    // The broker must not change the shared sidecar's memory configuration.
+    // Reject legacy process-wide memory overrides as well as current commands.
     if args.iter().take_while(|a| a.as_str() != "--")
         .any(|a| a == "--memory-cap" || a.starts_with("--memory-cap=")) {
         return Err("Change the memory budget in Oculus Settings.".into());
@@ -183,7 +183,8 @@ mod tests {
     fn broker_allows_queries_and_planning_but_not_host_administration() {
         for args in [vec![], vec!["--help"], vec!["--json", "files"],
             vec!["read", "lecture 学生.pdf"], vec!["project", "create", "Study"],
-            vec!["task", "add", "Revise"], vec!["task", "--json", "add", "--batch", "-"],
+            vec!["task", "add", "Revise"], vec!["task", "refile", "12", "-p", "7"],
+            vec!["task", "--json", "add", "--batch", "-"],
             vec!["lecture", "candidates", "abc", "--frames"]] {
             assert!(validate_args(&argv(&args)).is_ok(), "{args:?}");
         }

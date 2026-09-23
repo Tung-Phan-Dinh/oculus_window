@@ -10,53 +10,47 @@ configuration and is not required to build a clone of this repository.
 ## Build from source
 
 Install Bun, stable Rust for `x86_64-pc-windows-msvc`, Visual Studio 2022 C++
-Build Tools and the Windows SDK, sccache, and uv. Ensure they are on PATH in
+Build Tools and the Windows SDK, and sccache. Ensure they are on PATH in
 a fresh terminal. WebView2 is the Windows web runtime; the installer can
 install it if absent.
 
 ```powershell
 cd app
 bun install --frozen-lockfile
-bun run ffmpeg
-bun run prepare-sidecar
-bun run stage-cli
-cd ../sidecar
-uv sync --frozen --python 3.12
-cd ../app
 bun run tauri dev
 ```
 
 `bun run tauri build` creates
 `app/src-tauri/target/release/bundle/nsis/Oculus_0.1.0_x64-setup.exe`.
-The per-user installer includes the app, `oculus.exe`, ffmpeg, the Python
-source/lockfile and uv. No macOS venv, developer path or model cache is shipped.
+The per-user installer includes the app, `oculus.exe`, ffmpeg and `pdfium.dll`.
+The dev preflight builds the debug CLI and stages its external-binary slot,
+including on a clean checkout. `scripts/dev.mjs` starts Bun with the watcher
+environment without Unix-only shell syntax. No Python runtime is shipped.
 `app/src-tauri/tauri.windows.conf.json` owns the native Windows title bar,
 NSIS install mode and resource mapping.
 
 ## First installed launch
 
-The app opens immediately and prepares Python 3.12 plus the locked dependencies
-in `%APPDATA%\com.tchan.oculus\python-runtime\.venv`. This requires internet
-and several GB of disk space. uv's cache is reused on later launches; the
-packaged source manifest removes only retired app-managed Python files while
-preserving the venv. Settings → Library displays setup status. Diagnostics are
-in `sidecar-setup.log` and `sidecar.log` in the same application data folder.
-Restart after correcting a failed download to retry setup.
+The app opens without downloading a Python environment or loading local models.
+Settings → Library selects MinerU cloud (requires a token) or a separately
+started local MinerU server, and configures Voyage indexing. Read
+[parsing.md](./parsing.md) and [retrieval.md](./retrieval.md) before enabling
+remote processing. The app never falls back from one parsing engine to another.
+Windows keeps Local as the default when no engine was selected, preserving
+the earlier Windows app's local processing policy. An explicit legacy Cloud
+or Auto choice carries over as Cloud. A local server that is stopped reports
+unavailable instead of uploading the document elsewhere.
 
-The bootstrap validates and uses the full Python patch-version executable.
-This avoids uv's Windows minor-version junction failure without deleting an
-interpreter or changing machine-wide Python registrations.
+Upgrades keep existing coursework, chats, settings and parsed artifacts.
+The former `python-runtime` folder, source `.venv` and model caches are left
+in place; Oculus no longer starts them. Old Qwen embeddings do not match
+Voyage's model, so semantic search requires a new index. Parsed text remains
+available to lexical search. The app remains single-instance on Windows.
 
-MinerU and Qwen weights download separately on first use into the normal
-Hugging Face cache. Windows uses CUDA 13 wheels; the embedder selects CUDA
-when supported and CPU otherwise. Local parsing remains the default. MinerU
-cloud is opt-in and is never required to start or use the application.
-
-The installed app uses its packaged sources even if the original checkout
-still exists. Development builds use `sidecar/.venv`. Windows Job Objects own
-the entire Python process tree, including nested model/render workers. The
-app is single-instance, and a conflict on port 9547 is reported without killing
-an unrelated process. Worker startup is gated until process ownership exists.
+PDFium loads from beside the installed desktop/CLI executable or from the
+development `binaries` directory; `OCULUS_PDFIUM_LIB` can override it. The
+fetch script stages on the checkout's volume so a C: temporary directory and
+an F: checkout do not cause a cross-volume rename failure.
 
 ## Platform behavior
 
@@ -86,8 +80,9 @@ an unrelated process. Worker startup is gated until process ownership exists.
   the converter. Uploads lets students add their own subject files through
   the native picker or drag/drop, with deletion limited to that upload folder.
 
-The existing product boundary remains: lecture recap has a backend but no
-finished player tab; the BYOK API bridge is dormant; automations, Inbox and
+The update includes a transcript reading copy, split panes, lexical search,
+unified tasks, editable calendar events, image attachments and agent setup.
+The old recap and dormant BYOK layer were removed. Automations, Inbox and
 scheduled coursework sync are not reintroduced.
 
 ## Claude Code through WSL2
@@ -128,14 +123,12 @@ bun test tests
 bun run build
 cd src-tauri
 cargo test --release
-cd ../../sidecar
-uv run --frozen python -m unittest discover
 ```
 
 Rust tests include isolated Windows credential and scheduler round trips,
 Unicode media/range requests, file boundaries, paths, provider discovery and
-the upstream suites. Python tests cover real worker trees, forced owner exit,
-memory caps, Unicode pipes, download-cache behavior and parser routing.
+the upstream suites. Parser and embedding tests use local protocol fixtures;
+they do not require paid service requests or the user's coursework.
 Run the desktop as well: screenshots and UI interactions are necessary for
 WebView2 layout, tabs, viewers, fullscreen and authentication windows. A real
 Canvas sync additionally requires the user's university sign-in.
@@ -160,8 +153,8 @@ the build does not disable or modify Windows security settings.
    credentials or model weights over the Windows checkout.
 
 Key port seams are `app/src-tauri/src/platform.rs`,
-`app/src-tauri/src/python_runtime.rs`, `app/src-tauri/src/sidecar.rs`,
-`app/src-tauri/src/harness/discover.rs`, `sidecar/windows_process.py`, and
+`app/src-tauri/src/database.rs`, `app/src-tauri/src/harness/wsl.rs`,
+`app/src-tauri/src/harness/discover.rs`, `app/src-tauri/src/embed/raster.rs`, and
 `app/src/lib/platform.ts`.
 
 The Windows build pins a vendored `libsqlite3-sys` 0.30.1 with the SQLite

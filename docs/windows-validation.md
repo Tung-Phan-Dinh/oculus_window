@@ -5,6 +5,67 @@ Those files, installers and library backups are not included in this Git
 repository. Commands in the development and Windows guides reproduce the
 automated checks; live account checks are described separately below.
 
+## macOS master update — 2026-09-24
+
+Imported 66 macOS commits through
+`24d7511a742214f2aa0eb03b25f50aa870d990aa`, including split panes, library
+text search, the PDF.js reader, browser history and find, unified tasks,
+editable calendar events, chat attachments and skills, and the opencode and
+Antigravity providers. Windows keeps its native shortcuts, physical SQLite
+path handling and Claude WSL2 sandbox.
+
+The parser now uses Rust with either an external local MinerU server or
+MinerU Cloud; Python is no longer bundled or launched. Windows upgrades
+without an explicit cloud preference retain local parsing. Old Qwen vectors
+require rebuilding with Voyage for semantic search; existing downloads and
+page text are retained. See [Windows setup](windows.md) for the new services.
+
+| Check | Result |
+| --- | --- |
+| Rust release suite | 474 passed, 3 ignored: 457 library, 14 CLI, one isolated Windows credential test and two migration integration tests. `artifacts/sept24-rust-tests.log`. |
+| PDF rasterization | 16 focused tests passed with PDFium actually rendering synthetic PDFs. Only the optional real-library fixture was omitted. `artifacts/sept24-raster-tests.log`. |
+| WSL2 supervisor | All 19 tests passed, including sandbox containment, native command brokering, generated skills, and the sign-in subprocess lifecycle. `artifacts/sept24-wsl-tests.log`. |
+| Frontend | 38 tests / 180 assertions passed; TypeScript and the production Vite build passed. Regression coverage includes FTS5 ranking, provider recovery, split-browser navigation and native input focus. |
+| Database upgrades | Migrations 1–33 remain unchanged. Synthetic upgrades through migration 37 retain tasks, subtasks, project links, chats, page text, vectors and model settings; foreign-key and integrity checks pass. |
+| Publication scan | Candidate files and inherited Git history checked; no credential-pattern findings or accidental runtime files. `artifacts/sept24-publish-audit.json`. |
+
+Native checks use a separate synthetic library upgraded from schema 33 to 37.
+Calendar displays its retained task and subtask, and the unified Tasks view
+shows both records. Closing and reopening a split restores its two app views.
+The PDF.js reader renders a two-page PDF with spaces and Unicode in its Windows
+path, including continuous view, two-page spread and fit-to-page. Native
+browser history, successful and unsuccessful text find, tab shortcuts and
+F11 fullscreen were exercised against a loopback fixture server. Ctrl+L and
+Ctrl+F transfer focus from the native page to the app's fields; Ctrl+K accepts
+typed text and finds the expected document page with a highlighted excerpt.
+The fixture passes SQLite integrity and foreign-key checks after the upgrade.
+
+The checks caught and fixed an inherited FTS5 aggregate-ranking error, failed
+provider catalogue recovery, and native browser focus and split-adoption races.
+A closed backup of the user's original library passed integrity checks with
+all 560 file records before testing. Its 33 recorded SQLx migration checksums
+match the unchanged migration definitions in this update.
+
+The final release build and NSIS packaging passed. The installer at
+`app/src-tauri/target/release/bundle/nsis/Oculus_0.1.0_x64-setup.exe` is
+42,424,879 bytes, with SHA-256
+`e2dbfcba78c2e2a447cbad705142407d364cdd90f64b0838c46199386b80913f`.
+The build log is `artifacts/sept24-release-final.log`. Installation over the
+existing app completed with exit code 0; the installed desktop app, CLI,
+ffmpeg and PDFium are present, and `oculus --version` succeeds.
+
+The installed app then upgraded the real library to schema 37. SQLite
+integrity and foreign-key checks pass, all 560 file records remain, and the
+Subjects view displays the four current subjects and 18 past subjects in
+English. Temporary Unicode test files were removed from the real app-data
+directory. The existing Canvas session was rejected and needs sign-in again;
+local parsing reports unavailable until an external MinerU server is running.
+
+This update's tests do not send coursework to MinerU or Voyage, invoke billed
+models, or exercise fresh external-provider sign-in. Earlier live checks below
+describe their dated builds and do not establish live-service compatibility
+for this update.
+
 ## Publication review — 2026-09-19
 
 The pre-publication review fixed three additional failure cases: Windows
@@ -160,7 +221,8 @@ verifies the distinction, and the balloon test still verifies termination
 when actual resident memory exceeds its test cap. This metric matches the
 POSIX RSS fallback but is not identical to macOS physical footprint. It does
 not fully account for GPU-managed memory; CUDA OOM recovery remains active.
-See [sidecar memory accounting](sidecar.md#memory-budget).
+This historical sidecar was removed in the September 24 update; see the
+current [parsing architecture](parsing.md).
 
 ## Initial installed-build checks
 

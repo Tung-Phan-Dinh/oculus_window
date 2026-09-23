@@ -1,12 +1,12 @@
 import { useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { applyTheme, getStoredTheme, watchSystemTheme } from "@/lib/theme";
-import { getDb, getParseSettings, reconcileStaleSyncRuns } from "@/lib/db";
+import { getDb, reconcileStaleSyncRuns } from "@/lib/db";
 import { useBackendEvents } from "@/hooks/useBackendEvents";
 import { useQualitySweep } from "@/hooks/useQualitySweep";
 import { watchNewFiles } from "@/stores/newFilesStore";
 import { watchLectureDownloads } from "@/stores/lectureDownloadStore";
 import AppLayout from "@/layouts/AppLayout";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 
 function EventBridge() {
   useBackendEvents();
@@ -27,15 +27,8 @@ export default function App() {
     // the schema is up to date before any page mounts.
     getDb()
       .then(async () => {
-        const [n, parse] = await Promise.all([
-          reconcileStaleSyncRuns(),
-          getParseSettings(),
-        ]);
+        const n = await reconcileStaleSyncRuns();
         if (n) console.warn(`marked ${n} interrupted sync run(s) failed`);
-        await invoke("sidecar_set_limits", {
-          memoryCapMb: parse.memoryCapMb,
-          backend: parse.backend,
-        }).catch(() => {});
       })
       .catch((e) => console.error("db init failed", e));
 
@@ -45,9 +38,9 @@ export default function App() {
   // The shell is no longer a route element: it is above every tab's router
   // (`app/src/routes.tsx`), and the tabs are mounted inside it.
   return (
-    <>
+    <ErrorBoundary>
       <EventBridge />
       <AppLayout />
-    </>
+    </ErrorBoundary>
   );
 }

@@ -53,6 +53,10 @@ elif mode == 'broker':
     result = subprocess.run(['oculus', 'search', "量子 mechanics ' ; $(echo unsafe)", '--json'], capture_output=True, text=True)
     emit({'type': 'broker_result', 'code': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr})
     time.sleep(30)
+elif mode == 'skills':
+    emit({'type': 'skills', 'writes': [attempt_write(pathlib.Path.cwd() / path / 'SKILL.md', 'tampered')
+                                     for path in ('skills', '.claude/skills', '.agents/skills')]})
+    time.sleep(30)
 elif mode == 'batch':
     batch = pathlib.Path.cwd() / 'batch 学生.json'
     batch.write_text('[{"title":"学生 task λ"}]', encoding='utf-8')
@@ -494,6 +498,55 @@ class WslBridgeTests(unittest.TestCase):
         code = session.process.wait(timeout=7)
         self.assertNotEqual(code, 0)
         self.assertFalse((self.agents / "允许.txt").exists())
+
+    def test_generated_skills_are_readonly_inside_the_writable_agent_folder(self):
+        for relative in ("skills", ".claude/skills", ".agents/skills"):
+            folder = self.agents / relative
+            folder.mkdir(parents=True)
+            (folder / "SKILL.md").write_text("generated")
+        session = Session(self, "skills")
+        result = session.receive()
+        self.assertEqual(result["type"], "skills")
+        for error in result["writes"]:
+            self.assertIn(error, (errno.EROFS, errno.EACCES, errno.EPERM))
+        for relative in ("skills", ".claude/skills", ".agents/skills"):
+            self.assertEqual((self.agents / relative / "SKILL.md").read_text(), "generated")
+
+    def test_sign_in_preserves_code_and_cancels_on_owner_eof(self):
+        fake = self.home / "fake-auth"
+        fake.write_text("#!/usr/bin/python3\n"
+                        "import json,os,sys,time\n"
+                        "assert sys.argv[1:]==['auth','login']\n"
+                        "print(json.dumps({'ready':os.getpid()}),flush=True)\n"
+                        "code=sys.stdin.readline().strip()\n"
+                        "print(json.dumps({'code':code},ensure_ascii=False),flush=True)\n")
+        fake.chmod(0o700)
+        launcher = LAUNCHER.replace("sys.exit(bridge.session())", "sys.exit(bridge.auth_login(info))")
+        info = json.dumps({"home": str(self.home), "claude": str(fake)})
+        for send_code in (True, False):
+            process = subprocess.Popen([sys.executable, "-u", "-c", launcher,
+                                        str(MODULE), info, "15"],
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True)
+            try:
+                pid = json.loads(process.stdout.readline())["ready"]
+                if send_code:
+                    process.stdin.write("code 学生 λ\n")
+                    process.stdin.flush()
+                    self.assertEqual(json.loads(process.stdout.readline()), {"code": "code 学生 λ"})
+                    self.assertEqual(process.wait(timeout=5), 0)
+                else:
+                    process.stdin.close()
+                    self.assertNotEqual(process.wait(timeout=5), 0)
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(pid, 0)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+                for pipe in (process.stdin, process.stdout, process.stderr):
+                    if not pipe.closed:
+                        pipe.close()
 
 
 if __name__ == "__main__":

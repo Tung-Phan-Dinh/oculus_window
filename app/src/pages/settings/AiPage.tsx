@@ -1,131 +1,196 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { ArrowsClockwise, CircleNotch, PaperPlaneRight, Plus, X } from "@phosphor-icons/react";
-import {
-  CLAUDE_MODELS,
-  codexAsModels,
-  defaultSelection,
-  harnessCodexModels,
-  type CodexModel,
-  type Provider,
-} from "@/lib/harness";
-import { ModelPicker, type PickerProvider } from "@/components/harness/ModelPicker";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ArrowsClockwise, CircleNotch } from "@phosphor-icons/react";
+import { defaultSelection, type Provider } from "@/lib/harness";
+import { ModelPicker } from "@/components/harness/ModelPicker";
+import { useBridgeHealth } from "@/hooks/useBridgeHealth";
+import { useProviderModels } from "@/hooks/useProviderModels";
+import { signInAccount, signInState, useSignInStatus } from "@/hooks/useSignInStatus";
+import { SignInDialog, useSignIn } from "@/components/harness/SignInDialog";
 import { Button } from "@/components/ui/button";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { FallbackList } from "@/components/llm/FallbackList";
-import { ModelBrowser } from "@/components/llm/ModelBrowser";
-import { ModelSelect } from "@/components/llm/ModelSelect";
-import {
-  DEFAULT_BASE_URL,
-  normalizeBaseUrl,
-  ProviderCard,
-} from "@/components/llm/ProviderCard";
-import {
-  ADDABLE_PROVIDER_KINDS,
   DEFAULT_JOB_MODELS,
   getJobModels,
-  getLlmSettings,
   JOBS,
   setJobModels,
-  modelKey,
-  MAX_FALLBACKS,
-  PROVIDER_KINDS,
-  sameModel,
-  setLlmSettings,
-  type LlmProvider,
-  type LlmProviderKind,
   type JobId,
   type JobModels,
   type JobSelection,
-  type LlmSettings,
-  type ModelRef,
 } from "@/lib/db";
-import { Section, StatRow } from "./section";
+import { OpencodeProvidersSection } from "@/components/settings/OpencodeProvidersSection";
+import {
+  InstallAgentDialog,
+  useAgentInstall,
+} from "@/components/settings/InstallAgentDialog";
+import { Section } from "./section";
 import { isWindows } from "@/lib/platform";
-import { useHarnessProviders } from "@/hooks/useHarnessProviders";
-import { useHarnessHealthStore } from "@/stores/harnessHealthStore";
-
-interface UsageSummary {
-  monthPromptTokens: number;
-  monthCompletionTokens: number;
-  monthCostUsd: number;
-  monthRequests: number;
-}
-
-/** Provider ids are keychain accounts, so they are readable and stable:
- *  `openrouter`, then `openrouter-2` for a second account of the same kind. */
-function newProviderId(kind: string, existing: LlmProvider[]): string {
-  if (!existing.some((p) => p.id === kind)) return kind;
-  for (let n = 2; ; n++) {
-    const id = `${kind}-${n}`;
-    if (!existing.some((p) => p.id === id)) return id;
-  }
-}
 
 /**
  * The CLI agents behind Chat: where each binary was found and which version,
- * or why it was not. Rechecking clears the cached lookup, for right after an
- * install.
+ * or why it was not.
+ *
+ * This is no longer the only reader — every model picker asks the same
+ * question now, and a provider with no binary reads as *not installed* there
+ * rather than offering a catalogue nothing can run — so the answer comes from
+ * the shared `useBridgeHealth`. This page keeps the one thing that is its
+ * alone: *Recheck* is the only caller that passes `recheck`, which is what
+ * drops Rust's cached lookups and pays for a fresh probe after an install.
+ *
+ * It is also the only place that can *do* something about a missing one. A
+ * row with no path carries *Install*, which opens the commands this machine
+ * can run and runs the one that is picked
+ * (`app/src/components/settings/InstallAgentDialog.tsx`). The run is held
+ * here rather than in that dialog so closing it mid-install strands neither
+ * the output nor the recheck the finish fires — and `recheck` is exactly the
+ * hand-off, since a CLI installed a second ago stays missing until Rust's
+ * cached failure is dropped.
+ *
+ * A row whose CLI *is* here answers the second question too — whether it is
+ * signed in, and as whom. Being installed and being usable are different
+ * facts, and until this stage the second one only surfaced as a red row in the
+ * timeline after a turn had already failed. Sign-in status is its own shared
+ * read (`app/src/hooks/useSignInStatus.ts`) rather than a field on health,
+ * because Rust answers it by spawning the CLI and asking, where health is a
+ * cached lookup — so *Recheck* drops both caches and asks both questions.
+ *
+ * opencode's row says nothing here, and that is the contract rather than an
+ * omission: its credentials are per provider, so `harness_sign_in_status`
+ * answers `signedIn: null` and the providers strip below is the answer.
  */
 function CliAgentsSection() {
-  const health = useHarnessHealthStore((state) => state.health);
-  const checking = useHarnessHealthStore((state) => state.checking);
-  const error = useHarnessHealthStore((state) => state.error);
-  const refresh = useHarnessHealthStore((state) => state.refresh);
-  useEffect(() => { void refresh(); }, [refresh]);
+  const { health, recheck, checking, error } = useBridgeHealth();
+  const { statuses, recheck: recheckSignIn, checking: checkingSignIn } = useSignInStatus();
+  /** One button, both questions — a row that said "installed" and went on
+   *  saying "signed out" a minute after signing in would be the row that
+   *  lies. */
+  const recheckAll = useCallback(() => {
+    recheck();
+    recheckSignIn();
+  }, [recheck, recheckSignIn]);
+
+  const install = useAgentInstall(recheck);
+  const signIn = useSignIn(recheckSignIn);
+  /** Which row's dialog is open. Separate from the run above: the run
+   *  outlives the dialog, and the dialog can be opened on a row with no run. */
+  const [openFor, setOpenFor] = useState<{ provider: Provider; label: string } | null>(null);
+  const [signInFor, setSignInFor] = useState<Provider | null>(null);
 
   return (
     <Section
       title="CLI agents"
       description={isWindows
-        ? "Chat runs Codex on Windows or Claude Code through WSL2, signed in as you. Claude uses its Linux sandbox and a separate sign-in inside WSL2."
-        : "Chat runs Claude Code or Codex from your own machine, signed in as you — no API key, no per-token billing."}
+        ? "Chat runs Codex, opencode and Antigravity on Windows, or Claude Code through WSL2. Sign in to your chosen agent; opencode's API providers use their own billing."
+        : "Chat runs your installed CLI agents. Sign in to your chosen agent; opencode's API providers use their own billing."}
     >
       <div className="divide-y divide-border-subtle">
-        {(health ?? []).map((h) => (
-          <div key={h.provider} className="flex items-start justify-between gap-4 py-2.5">
-            <div className="min-w-0">
-              <div className="text-[13px] text-foreground">{h.label}</div>
-              <div className="mt-0.5 truncate text-xs text-muted-foreground">
-                {h.path ?? (!h.error && (
-                  <>
-                    Not found. Install it, or set <span className="text-foreground">{h.overrideEnv}</span> to the binary.
-                  </>
-                ))}
+        {(health ?? []).map((h) => {
+          // `unknown` — the probe has not landed, or this is opencode — draws
+          // nothing at all, the same three-state discipline the model picker
+          // uses for health.
+          const state = h.path ? signInState(statuses, h.provider) : "unknown";
+          const account = signInAccount(statuses, h.provider);
+          return (
+            <div key={h.provider} className="flex items-start justify-between gap-4 py-2.5">
+              <div className="min-w-0">
+                <div className="text-[13px] text-foreground">{h.label}</div>
+                <div className="mt-0.5 truncate text-xs text-muted-foreground">
+                  {h.path ?? (
+                    <>
+                      Not found. Install it, or set <span className="text-foreground">{h.overrideEnv}</span> to the binary.
+                    </>
+                  )}
+                </div>
+                {state !== "unknown" && (
+                  <div className="mt-0.5 text-xs text-muted-foreground">
+                    {state === "in" ? (account ? `Signed in — ${account}` : "Signed in") : "Signed out"}
+                  </div>
+                )}
+                {h.error && <div className="mt-0.5 text-xs text-destructive">{h.error}</div>}
               </div>
-              {h.error && <div className="mt-0.5 text-xs text-destructive">{h.error}</div>}
+              <div className="flex shrink-0 items-center gap-2">
+                <span className="text-xs tabular-nums text-muted-foreground">
+                  {h.error ? "unavailable" : h.version ? `v${h.version}` : h.path ? "—" : "missing"}
+                </span>
+                {state === "out" && (
+                  <Button variant="outline" size="xs" onClick={() => setSignInFor(h.provider)}>
+                    {signIn.run?.provider === h.provider && !signIn.run.result ? (
+                      <>
+                        <CircleNotch size={12} className="animate-spin" />
+                        Signing in…
+                      </>
+                    ) : (
+                      "Sign in"
+                    )}
+                  </Button>
+                )}
+                {!h.path && (
+                  <Button
+                    variant="outline"
+                    size="xs"
+                    onClick={() => setOpenFor({ provider: h.provider, label: h.label })}
+                  >
+                    {install.run?.provider === h.provider && !install.run.result ? (
+                      <>
+                        <CircleNotch size={12} className="animate-spin" />
+                        Installing…
+                      </>
+                    ) : (
+                      "Install"
+                    )}
+                  </Button>
+                )}
+              </div>
             </div>
-            <div className="shrink-0 text-xs tabular-nums text-muted-foreground">
-              {h.error ? "unavailable" : h.version ? `v${h.version}` : h.path ? "—" : "missing"}
-            </div>
-          </div>
-        ))}
+          );
+        })}
         {health === null && !error && (
           <div className="py-2.5 text-xs text-muted-foreground">Checking…</div>
         )}
       </div>
       {error && <p className="mt-1 text-xs text-destructive">{error}</p>}
-      <Button variant="ghost" size="xs" className="mt-2" onClick={() => { void refresh(true); }} disabled={checking}>
-        {checking ? <CircleNotch size={12} className="animate-spin" /> : <ArrowsClockwise size={12} />}
+      <Button
+        variant="ghost"
+        size="xs"
+        className="mt-2"
+        onClick={recheckAll}
+        disabled={checking || checkingSignIn}
+      >
+        {checking || checkingSignIn ? (
+          <CircleNotch size={12} className="animate-spin" />
+        ) : (
+          <ArrowsClockwise size={12} />
+        )}
         Recheck
       </Button>
+      {openFor && (
+        <InstallAgentDialog
+          provider={openFor.provider}
+          label={openFor.label}
+          run={install.run?.provider === openFor.provider ? install.run : null}
+          onStart={(route) => install.start(openFor.provider, route)}
+          onClose={() => {
+            // A finished run is cleared with the dialog, so reopening the row
+            // offers the commands again rather than a log of what already
+            // happened. One still running is kept, and reopening resumes it.
+            if (install.run?.result) install.clear();
+            setOpenFor(null);
+          }}
+        />
+      )}
+      {signInFor && (
+        <SignInDialog
+          provider={signInFor}
+          run={signIn.run?.provider === signInFor ? signIn.run : null}
+          onStart={() => signIn.start(signInFor)}
+          onCode={(code) => signIn.submitCode(code)}
+          onCancel={() => signIn.cancel()}
+          onClose={() => {
+            // Same rule as the install above: a finished run is cleared with
+            // the dialog, one still in flight is kept and resumes on reopen.
+            if (signIn.run?.result) signIn.clear();
+            setSignInFor(null);
+          }}
+        />
+      )}
     </Section>
   );
 }
@@ -141,9 +206,7 @@ function CliAgentsSection() {
  * second copy of the selection anywhere.
  */
 function JobModelsSection() {
-  const availableProviders = useHarnessProviders();
   const [jobs, setJobs] = useState<JobModels | null>(null);
-  const [codex, setCodex] = useState<CodexModel[] | null>(null);
   /** What is already in the database, so the save effect below can tell an
    *  edit from the load that started it. */
   const saved = useRef<string | null>(null);
@@ -157,24 +220,12 @@ function JobModelsSection() {
       });
   }, []);
 
-  // Codex lists its own models over its CLI, and a row set to Codex has to
-  // show the model's name rather than its id — so the ask happens only when a
-  // job is actually on Codex, not merely because this page was opened.
-  const wantsCodex = !!jobs && JOBS.some((j) => jobs[j.id].provider === "codex");
-  useEffect(() => {
-    if (!wantsCodex || codex) return;
-    harnessCodexModels().then(setCodex).catch(() => setCodex([]));
-  }, [wantsCodex, codex]);
-
-  const models = useCallback(
-    (p: Provider) => (p === "claude" ? CLAUDE_MODELS : codexAsModels(codex ?? [])),
-    [codex],
-  );
-  const providers: PickerProvider[] = availableProviders.map((p) => ({
-    ...p,
-    models: models(p.id),
-    loading: p.id === "codex" && codex === null,
-  }));
+  // An agent whose catalogue comes from its CLI is asked only when a job is
+  // actually set to it — a row has to show its model's name rather than its
+  // id — and not merely because this page was opened. Switching a row is what
+  // asks, since `needed` changes with it.
+  const needed = useMemo(() => (jobs ? JOBS.map((j) => jobs[j.id].provider) : []), [jobs]);
+  const { providers, modelsFor } = useProviderModels(needed);
 
   const edit = (id: JobId, patch: Partial<JobSelection>) =>
     setJobs((prev) => (prev ? { ...prev, [id]: { ...prev[id], ...patch } } : prev));
@@ -194,23 +245,23 @@ function JobModelsSection() {
   }, [jobs]);
 
   /** A row sits without a model only while a provider's list is still coming
-   *  — Codex's is fetched, not compiled in — so it is filled the moment one
-   *  exists, exactly as the composer fills an empty selection. */
+   *  — every catalogue but Claude's is fetched — so it is filled the moment
+   *  one exists, exactly as the composer fills an empty selection. */
   useEffect(() => {
     if (!jobs) return;
     for (const job of JOBS) {
       const row = jobs[job.id];
       if (row.model) continue;
-      const pick = defaultSelection(models(row.provider));
+      const pick = defaultSelection(modelsFor(row.provider));
       if (pick.model) edit(job.id, { model: pick.model, reasoningEffort: pick.reasoning });
     }
-  }, [jobs, models]);
+  }, [jobs, modelsFor]);
 
   /** Switching agent takes the model and the level with it: a Claude model id
    *  means nothing to Codex. Claude's list is compiled in so the new selection
-   *  is immediate; Codex's arrives with its list, above. */
+   *  is immediate; a fetched one arrives with its list, above. */
   const switchProvider = (id: JobId, provider: Provider) => {
-    const pick = defaultSelection(models(provider));
+    const pick = defaultSelection(modelsFor(provider));
     edit(id, { provider, model: pick.model ?? "", reasoningEffort: pick.reasoning });
   };
 
@@ -250,488 +301,11 @@ function JobModelsSection() {
 }
 
 export default function SettingsAiPage() {
-  const [settings, setSettings] = useState<LlmSettings | null>(null);
-  const [usage, setUsage] = useState<UsageSummary | null>(null);
-  const [browsing, setBrowsing] = useState(false);
-  const [adding, setAdding] = useState(false);
-  const [testModel, setTestModel] = useState<ModelRef | null>(null);
-  const [testPrompt, setTestPrompt] = useState("");
-  const [testOutput, setTestOutput] = useState<string | null>(null);
-  const [testError, setTestError] = useState<string | null>(null);
-  const [testing, setTesting] = useState(false);
-
-  /** Latest saved settings, tracked outside render: ticking several models in
-   *  the browser fires edits faster than React re-renders, and a patch built
-   *  from a stale copy would silently drop the previous one. */
-  const latest = useRef<LlmSettings | null>(null);
-
-  /** Merge a patch into settings and persist — settings save as you go. The
-   *  function form sees whatever the last edit wrote. */
-  const update = useCallback(
-    async (
-      patch: Partial<LlmSettings> | ((prev: LlmSettings) => Partial<LlmSettings>),
-    ) => {
-      const prev = latest.current ?? (await getLlmSettings());
-      const next = { ...prev, ...(typeof patch === "function" ? patch(prev) : patch) };
-      latest.current = next;
-      setSettings(next);
-      await setLlmSettings(next);
-    },
-    [],
-  );
-
-  const refreshUsage = useCallback(() => {
-    invoke<UsageSummary>("llm_usage_summary").then(setUsage).catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    getLlmSettings().then((s) => {
-      latest.current = s;
-      setSettings(s);
-    });
-    refreshUsage();
-  }, [refreshUsage]);
-
-  // Streamed deltas from the test prompt append to the output area.
-  const testBuf = useRef("");
-  useEffect(() => {
-    const un = listen<string>("llm-test-delta", (e) => {
-      testBuf.current += e.payload;
-      setTestOutput(testBuf.current);
-    });
-    return () => {
-      un.then((f) => f()).catch(() => {});
-    };
-  }, []);
-
-  if (!settings) return null;
-
-  const addProvider = async (draft: {
-    kind: LlmProviderKind;
-    label: string;
-    baseUrl: string;
-    key: string;
-  }) => {
-    const provider: LlmProvider = {
-      id: newProviderId(draft.kind, settings.providers),
-      kind: draft.kind,
-      label: draft.label.trim() || (PROVIDER_KINDS.find((p) => p.kind === draft.kind)?.label ?? "Provider"),
-      baseUrl: normalizeBaseUrl(draft.baseUrl) || null,
-    };
-    await update((prev) => ({ providers: [...prev.providers, provider] }));
-    if (draft.key.trim()) {
-      await invoke("llm_set_api_key", { providerId: provider.id, key: draft.key.trim() });
-    }
-    setAdding(false);
-  };
-
-  /** Removing a provider takes its models with it — a library entry pointing
-   *  at an endpoint that no longer exists is a call that fails at send time. */
-  const removeProvider = async (id: string) => {
-    const keeps = (m: ModelRef) => m.providerId !== id;
-    await update((prev) => ({
-      providers: prev.providers.filter((p) => p.id !== id),
-      library: prev.library.filter(keeps),
-      chatModel: prev.chatModel && keeps(prev.chatModel) ? prev.chatModel : null,
-      fallbacks: prev.fallbacks.filter(keeps),
-    }));
-    await invoke("llm_delete_api_key", { providerId: id }).catch(() => {});
-  };
-
-  const toggleLibrary = (m: ModelRef) =>
-    update((prev) => {
-      if (!prev.library.some((l) => sameModel(l, m))) {
-        return { library: [...prev.library, m] };
-      }
-      const keeps = (x: ModelRef) => !sameModel(x, m);
-      return {
-        library: prev.library.filter(keeps),
-        chatModel: sameModel(prev.chatModel, m) ? null : prev.chatModel,
-        fallbacks: prev.fallbacks.filter(keeps),
-      };
-    });
-
-  /** The chain is capped, so a new entry lands at the bottom and pushes the
-   *  old bottom out — no dialog, no "which one do you want to drop". */
-  const addFallback = (m: ModelRef) =>
-    update((prev) => {
-      const rest = prev.fallbacks.filter((f) => !sameModel(f, m));
-      return { fallbacks: [...rest.slice(0, MAX_FALLBACKS - 1), m] };
-    });
-
-  const runTest = async () => {
-    const prompt = testPrompt.trim();
-    if (!prompt || testing) return;
-    setTesting(true);
-    setTestError(null);
-    testBuf.current = "";
-    setTestOutput("");
-    try {
-      await invoke("llm_test_prompt", { prompt, model: testModel ?? settings.chatModel });
-    } catch (e) {
-      setTestError(String(e));
-    } finally {
-      setTesting(false);
-      refreshUsage();
-    }
-  };
-
-  const providerLabel = (id: string) =>
-    settings.providers.find((p) => p.id === id)?.label ?? "missing provider";
-
   return (
     <div className="flex flex-col gap-8">
       <CliAgentsSection />
+      <OpencodeProvidersSection />
       <JobModelsSection />
-
-      <Section
-        title="Providers"
-        description="Local and cloud providers share the same OpenAI-compatible API, and you can keep as many as you like configured at once. Keys are stored in your device's credential store, never in the database."
-      >
-        <div className="flex flex-col gap-2 py-1">
-          {settings.providers.map((p) => (
-            <ProviderCard
-              key={p.id}
-              provider={p}
-              onChange={(patch) =>
-                update((prev) => ({
-                  providers: prev.providers.map((x) =>
-                    x.id === p.id ? { ...x, ...patch } : x,
-                  ),
-                }))
-              }
-              onRemove={() => removeProvider(p.id)}
-            />
-          ))}
-          <div>
-            <Button variant="outline" size="xs" onClick={() => setAdding(true)}>
-              <Plus size={13} /> Add provider
-            </Button>
-          </div>
-        </div>
-      </Section>
-
-      <Section
-        title="Model library"
-        description="The models you actually use, gathered from every provider. Browsing a provider lists everything it serves; the library is what the rest of the app chooses from."
-      >
-        <div className="flex items-center justify-between gap-4 py-2">
-          <span className="text-xs text-muted-foreground">
-            {settings.library.length} model{settings.library.length === 1 ? "" : "s"}
-          </span>
-          <Button
-            variant="ghost"
-            size="xs"
-            onClick={() => setBrowsing(true)}
-            disabled={settings.providers.length === 0}
-          >
-            <Plus size={13} /> Add models
-          </Button>
-        </div>
-
-        {settings.library.length === 0 ? (
-          <p className="text-xs text-muted-foreground py-1">
-            {settings.providers.length === 0
-              ? "Add a provider first, then pick models from it."
-              : "Nothing yet — add models to choose one for chat."}
-          </p>
-        ) : (
-          <div className="flex flex-col gap-1 py-1">
-            {settings.library.map((m) => (
-              <div
-                key={modelKey(m)}
-                className="flex items-center gap-2 rounded-md border border-border bg-surface px-2 py-1.5"
-              >
-                <span className="text-xs text-foreground truncate">{m.model}</span>
-                <span className="text-[11px] text-muted-foreground truncate">
-                  {providerLabel(m.providerId)}
-                </span>
-                <div className="flex-1" />
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  aria-label={`Remove ${m.model}`}
-                  className="text-muted-foreground hover:text-destructive"
-                  onClick={() => toggleLibrary(m)}
-                >
-                  <X size={12} />
-                </Button>
-              </div>
-            ))}
-          </div>
-        )}
-      </Section>
-
-      <Section
-        title="Defaults"
-        description="The model chat answers with over your library. It can be changed per conversation from the chat composer."
-      >
-        <div className="flex items-center justify-between gap-4 py-2">
-          <span className="text-xs text-muted-foreground">Chat model</span>
-          <ModelSelect
-            library={settings.library}
-            providers={settings.providers}
-            value={settings.chatModel}
-            onChange={(m) => update({ chatModel: m })}
-            className="w-72"
-          />
-        </div>
-      </Section>
-
-      <Section
-        title="Fallbacks"
-        description={`Tried in order when the chosen model cannot run — a local model the machine has no room for, or a provider you removed. Up to ${MAX_FALLBACKS}; drag to reorder.`}
-      >
-        <FallbackList
-          items={settings.fallbacks}
-          providers={settings.providers}
-          onReorder={(next) => update({ fallbacks: next })}
-          onRemove={(m) =>
-            update((prev) => ({
-              fallbacks: prev.fallbacks.filter((f) => !sameModel(f, m)),
-            }))
-          }
-        />
-        <div className="flex items-center justify-between gap-4 py-2">
-          <span className="text-xs text-muted-foreground">
-            {settings.fallbacks.length >= MAX_FALLBACKS
-              ? "Full — adding one drops the last in the list"
-              : "Add a fallback"}
-          </span>
-          <ModelSelect
-            library={settings.library}
-            providers={settings.providers}
-            value={null}
-            onChange={addFallback}
-            placeholder="Add a model"
-            className="w-72"
-          />
-        </div>
-        <p className="text-xs text-muted-foreground pt-1">
-          A local model is only loaded when the machine has room for it — memory the
-          system could actually give it, with anything Ollama already holds loaded
-          counted as available. If it doesn't fit, the first fallback that does runs
-          instead; with none set, the request is refused rather than risking the
-          machine.
-        </p>
-      </Section>
-
-      <Section
-        title="Limits"
-        description="Calls are refused once a monthly cap is reached. Leave blank for no cap; local models cost nothing."
-      >
-        <div className="flex items-center justify-between gap-4 py-2">
-          <Label htmlFor="llm-cap-usd" className="text-xs font-normal text-muted-foreground">
-            Monthly spend (USD)
-          </Label>
-          <Input
-            id="llm-cap-usd"
-            type="number"
-            min={0}
-            step="0.5"
-            className="h-7 w-28 text-xs text-right"
-            defaultValue={settings.limits.monthlyUsd ?? ""}
-            onBlur={(e) =>
-              update({
-                limits: {
-                  ...settings.limits,
-                  monthlyUsd: e.target.value === "" ? null : Number(e.target.value),
-                },
-              })
-            }
-          />
-        </div>
-        <div className="flex items-center justify-between gap-4 py-2">
-          <Label htmlFor="llm-cap-tokens" className="text-xs font-normal text-muted-foreground">
-            Monthly tokens
-          </Label>
-          <Input
-            id="llm-cap-tokens"
-            type="number"
-            min={0}
-            step={100000}
-            className="h-7 w-28 text-xs text-right"
-            defaultValue={settings.limits.monthlyTokens ?? ""}
-            onBlur={(e) =>
-              update({
-                limits: {
-                  ...settings.limits,
-                  monthlyTokens: e.target.value === "" ? null : Number(e.target.value),
-                },
-              })
-            }
-          />
-        </div>
-      </Section>
-
-      <Section title="Usage this month">
-        <StatRow label="Requests" value={String(usage?.monthRequests ?? 0)} />
-        <StatRow
-          label="Tokens"
-          value={`${(
-            (usage?.monthPromptTokens ?? 0) + (usage?.monthCompletionTokens ?? 0)
-          ).toLocaleString()} (${(usage?.monthPromptTokens ?? 0).toLocaleString()} in / ${(
-            usage?.monthCompletionTokens ?? 0
-          ).toLocaleString()} out)`}
-        />
-        <StatRow label="Cost" value={`$${(usage?.monthCostUsd ?? 0).toFixed(2)}`} />
-      </Section>
-
-      <Section
-        title="Test"
-        description="Sends one prompt straight to a model — the way to check a provider's key and base URL before anything depends on it."
-      >
-        <div className="flex items-center justify-between gap-4 py-2">
-          <span className="text-xs text-muted-foreground">Model</span>
-          <ModelSelect
-            library={settings.library}
-            providers={settings.providers}
-            value={testModel ?? settings.chatModel}
-            onChange={setTestModel}
-            className="w-72"
-          />
-        </div>
-        <div className="flex items-center gap-1.5 py-2">
-          <Input
-            className="h-7 flex-1 text-xs"
-            placeholder="Say hello in five words"
-            value={testPrompt}
-            onChange={(e) => setTestPrompt(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && runTest()}
-            disabled={testing}
-          />
-          <Button size="xs" onClick={runTest} disabled={testing || !testPrompt.trim()}>
-            {testing ? (
-              <CircleNotch size={13} className="animate-spin" />
-            ) : (
-              <PaperPlaneRight size={13} />
-            )}
-            Run
-          </Button>
-        </div>
-        {testError && <p className="text-xs text-destructive py-1">{testError}</p>}
-        {testOutput !== null && !testError && (
-          <p className="text-xs text-foreground whitespace-pre-wrap py-1">
-            {testOutput || (testing ? "…" : "")}
-          </p>
-        )}
-      </Section>
-
-      <ModelBrowser
-        open={browsing}
-        onOpenChange={setBrowsing}
-        providers={settings.providers}
-        library={settings.library}
-        onToggle={toggleLibrary}
-      />
-      <AddProviderDialog open={adding} onOpenChange={setAdding} onAdd={addProvider} />
     </div>
-  );
-}
-
-function AddProviderDialog({
-  open,
-  onOpenChange,
-  onAdd,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  onAdd: (draft: {
-    kind: LlmProviderKind;
-    label: string;
-    baseUrl: string;
-    key: string;
-  }) => void;
-}) {
-  const [kind, setKind] = useState<LlmProviderKind>(ADDABLE_PROVIDER_KINDS[0].kind);
-  const [label, setLabel] = useState("");
-  const [baseUrl, setBaseUrl] = useState("");
-  const [key, setKey] = useState("");
-  const needsKey = PROVIDER_KINDS.find((p) => p.kind === kind)?.needsKey ?? true;
-  const kindLabel = PROVIDER_KINDS.find((p) => p.kind === kind)?.label ?? "";
-
-  // Each opening starts clean; the previous draft was either added or dropped.
-  useEffect(() => {
-    if (open) {
-      setKind(ADDABLE_PROVIDER_KINDS[0].kind);
-      setLabel("");
-      setBaseUrl("");
-      setKey("");
-    }
-  }, [open]);
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>Add provider</DialogTitle>
-          <DialogDescription>
-            An endpoint speaking the OpenAI-compatible API. Leave the base URL blank to
-            use the default for its kind.
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="flex flex-col gap-2.5">
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-muted-foreground w-16 shrink-0">Kind</span>
-            <Select value={kind} onValueChange={(v) => setKind(v as LlmProviderKind)}>
-              <SelectTrigger size="sm" className="h-7 flex-1 text-xs">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {ADDABLE_PROVIDER_KINDS.map((p) => (
-                  <SelectItem key={p.kind} value={p.kind} className="text-xs">
-                    {p.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-muted-foreground w-16 shrink-0">Name</span>
-            <Input
-              className="h-7 flex-1 text-xs"
-              placeholder={kindLabel}
-              value={label}
-              onChange={(e) => setLabel(e.target.value)}
-            />
-          </div>
-
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-muted-foreground w-16 shrink-0">Base URL</span>
-            <Input
-              className="h-7 flex-1 text-xs"
-              placeholder={DEFAULT_BASE_URL[kind]}
-              value={baseUrl}
-              onChange={(e) => setBaseUrl(e.target.value)}
-            />
-          </div>
-
-          {needsKey && (
-            <div className="flex items-center gap-2">
-              <span className="text-xs text-muted-foreground w-16 shrink-0">API key</span>
-              <Input
-                type="password"
-                className="h-7 flex-1 text-xs"
-                placeholder="sk-…"
-                value={key}
-                onChange={(e) => setKey(e.target.value)}
-              />
-            </div>
-          )}
-        </div>
-
-        <DialogFooter>
-          <Button
-            size="sm"
-            onClick={() => onAdd({ kind, label, baseUrl, key })}
-            disabled={kind === "custom" && !baseUrl.trim()}
-          >
-            Add provider
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
   );
 }

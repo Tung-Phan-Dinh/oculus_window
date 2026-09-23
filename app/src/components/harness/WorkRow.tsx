@@ -9,14 +9,23 @@ import {
   ListChecks,
   MagnifyingGlass,
   PencilSimpleLine,
+  SignIn,
   Terminal,
   UsersThree,
   Warning,
   Wrench,
 } from "@phosphor-icons/react";
 import type { Icon } from "@phosphor-icons/react";
+import { Button } from "@/components/ui/button";
 import { CodeText } from "@/components/markdown/MdComponents";
-import { parseToolMeta, toolVerb, type HarnessItem, type ToolKind } from "@/lib/harness";
+import {
+  parseToolMeta,
+  providerLabel,
+  toolVerb,
+  type HarnessItem,
+  type Provider,
+  type ToolKind,
+} from "@/lib/harness";
 import { libraryPath, openLibraryPath } from "@/lib/openFile";
 import { cn } from "@/lib/utils";
 
@@ -100,7 +109,23 @@ export function RowShell({
           )}
         >
           <IconC size={14} className="shrink-0" />
-          <span className="shrink-0">{title}</span>
+          {/* **Which part of the row gives way is the row's own answer.** With
+              an `em` the title is a verb — "Read", "Ran", "Looked up" — and the
+              path or command beside it is both the long part and the part
+              worth clipping, so the verb holds its width and the `em`
+              truncates. With no `em` the title *is* the long part: a bundle's
+              whole summary ("Explored 1 file, 1 search, looked up the library
+              once, ran 1 command") or an error's first line. Left at
+              `shrink-0` that row cannot narrow at all, and in a 300px dock it
+              does not merely overflow its own line — the scroller it sits in
+              gains a horizontal axis and the entire conversation slides
+              sideways under it. Nothing is lost to the clip: the row opens. */}
+          <span
+            className={cn("min-w-0", em ? "shrink-0" : "truncate")}
+            title={em ? undefined : title}
+          >
+            {title}
+          </span>
           {em && !path && (
             <span className="min-w-0 truncate font-medium text-foreground/80" title={em}>
               {em}
@@ -110,7 +135,7 @@ export function RowShell({
         {em && path && (
           <button
             type="button"
-            onClick={() => openLibraryPath(path)}
+            onClick={(e) => openLibraryPath(path, e.metaKey || e.ctrlKey)}
             title={em}
             className="min-w-0 truncate rounded font-medium text-foreground/80 underline decoration-transparent underline-offset-2 transition-colors hover:text-brand hover:decoration-brand"
           >
@@ -176,7 +201,7 @@ export const ToolRow = memo(function ToolRow({
   return (
     <RowShell
       icon={TOOL_ICON[kind]}
-      title={toolVerb(kind, done)}
+      title={toolVerb(kind, done, meta.name)}
       em={item.content ?? undefined}
       dim={dim && done}
       expandable={entries.length > 0 || output.length > 0}
@@ -234,8 +259,61 @@ export const ThinkingRow = memo(function ThinkingRow({
   );
 });
 
-export const ErrorRow = memo(function ErrorRow({ text }: { text: string }) {
+/**
+ * A turn that failed because the agent has no usable credentials — which is
+ * not a crash and should not be drawn as one.
+ *
+ * The plain error row is `destructive` throughout, and that is right for a
+ * turn that genuinely broke: there is nothing to do but read it. This is the
+ * opposite case. The agent is fine, the app is fine, and one button fixes it,
+ * so the card is the timeline's own `card` on a hairline border with the mark
+ * in `brand` — the accent this app uses for things in flight and things you
+ * can act on — and only the provider's own sentence underneath stays quiet.
+ * Red here would put a student off a two-click repair.
+ */
+const SignedOutCard = memo(function SignedOutCard({
+  provider,
+  message,
+  onSignIn,
+}: {
+  provider: Provider;
+  message: string;
+  onSignIn?: (provider: Provider) => void;
+}) {
+  return (
+    <div className="flex items-start gap-2.5 rounded-xl border border-border bg-card px-3 py-2.5">
+      <SignIn size={14} className="mt-0.5 shrink-0 text-brand" />
+      <div className="min-w-0 flex-1">
+        {/* The fact, not the raw message: "Failed to authenticate: OAuth
+            session expired and could not be refreshed" says what happened to
+            a program, not what happened to the student. */}
+        <div className="text-xs text-foreground">{providerLabel(provider)} is signed out</div>
+        <p className="mt-0.5 break-words text-[11.5px] leading-relaxed text-muted-foreground">
+          {message}
+        </p>
+      </div>
+      {onSignIn && (
+        <Button size="xs" className="shrink-0" onClick={() => onSignIn(provider)}>
+          Sign in
+        </Button>
+      )}
+    </div>
+  );
+});
+
+export const ErrorRow = memo(function ErrorRow({
+  text,
+  auth,
+  onSignIn,
+}: {
+  text: string;
+  /** Set when the message is that provider saying it has no credentials —
+   *  `parseErrorMeta` on the row, or the `error` event's own `auth`. */
+  auth?: Provider;
+  onSignIn?: (provider: Provider) => void;
+}) {
   const [first, ...rest] = text.split("\n");
+  if (auth) return <SignedOutCard provider={auth} message={text} onSignIn={onSignIn} />;
   return (
     <RowShell icon={Warning} title={first} tone="error" expandable={rest.length > 0} defaultOpen={false}>
       <CodeText className="rounded-lg border border-destructive/30 bg-card px-3 py-2 text-destructive">

@@ -3,8 +3,8 @@
 
 # The `oculus` CLI
 
-`--json` and `--memory-cap` are global: they work on every command below,
-and are listed once here rather than repeated in each section.
+`--json` is the one global flag: it works on every command below,
+and is listed once here rather than repeated in each section.
 
 ```
 Sync Canvas subjects and lectures into your local Oculus library
@@ -12,27 +12,25 @@ Sync Canvas subjects and lectures into your local Oculus library
 Usage: oculus [OPTIONS] [COMMAND]
 
 Commands:
-  status    Session, library and sidecar status
+  status    Session, library and parse status
   auth      Sign in to Canvas, or sign out
   list      List subjects or lectures
   run       Scrape Canvas content or sync lectures
   index     Re-parse and re-embed PDFs already on record
-  search    Search the library by meaning (needs the sidecar)
-  grep      Search the library by pattern (no sidecar needed)
+  search    Search the library by meaning (needs network and an API key)
+  grep      Search the library by pattern (offline, no model)
   read      Print the text of one library file
   files     List the files in the library
   calendar  Class times and assignment due dates
   project   Plan work: projects, their boards, and what is on them
-  task      Add, move, finish and delete the tasks on a project's board
+  task      Add, move, refile, finish and delete tasks, on a board or on none
   lecture   Look inside a downloaded lecture recording
   docs      Write the agent-facing docs into the library
-  agent     Run one prompt through a CLI agent (Claude Code or Codex)
+  agent     Run one prompt through a CLI agent (Claude Code, Codex, opencode or
+            Antigravity)
   help      Print this message or the help of the given subcommand(s)
 
 Options:
-      --memory-cap <MEMORY_CAP>
-          Whole sidecar process-tree memory cap in MB (minimum 5120)
-
       --json
           Print machine-readable JSON instead of formatted text
 
@@ -50,7 +48,7 @@ Options:
 ## `oculus status`
 
 ```
-Session, library and sidecar status
+Session, library and parse status
 
 Usage: oculus status
 
@@ -254,7 +252,7 @@ Options:
           Include subjects from past terms, not just the current one
 
       --no-parse
-          Skip the sidecar entirely: no PDF parsing and no embedding
+          Skip PDF processing entirely: no parsing and no embedding
 
       --no-embed
           Parse PDFs but do not embed them into the retrieval index
@@ -288,12 +286,14 @@ Options:
 ## `oculus search`
 
 ```
-Search the library by meaning (needs the sidecar).
+Search the library by meaning (needs network and an API key).
 
 The query is embedded by the same vision model that embedded every page image, so this
-finds a slide about Lagrange multipliers when you ask for "constrained optimisation". It
-needs the sidecar running (open the Oculus app); when it is not, this fails loudly and
-points at `oculus grep`, which searches the same text with no model.
+finds a slide about Lagrange multipliers when you ask for "constrained optimisation".
+Embedding happens in the cloud, so this needs a network connection and the Voyage key
+from Settings → Library; without either, and over an index that is empty or built by a
+retired model, it fails loudly and points at `oculus grep`, which searches the same text
+with no model at all.
 
 Only PDF and Office pages are ranked here — Canvas pages, announcements and Ed threads
 are markdown on disk and are covered by `oculus grep`.
@@ -323,15 +323,15 @@ Options:
 ## `oculus grep`
 
 ```
-Search the library by pattern (no sidecar needed).
+Search the library by pattern (offline, no model).
 
 Covers both halves of the library: the markdown on disk (Canvas pages, announcements,
 assignments, Ed threads) and the page text extracted from PDFs, which lives only in the
 database — ripgrep over the library directory cannot see it, which is why this exists.
 
-Needs no sidecar and no model, so it is the fallback whenever `oculus search` reports
-the sidecar is down. The pattern is a regular expression by default and case-insensitive
-unless you ask otherwise.
+Needs no network and no model, so it is the fallback whenever `oculus search` cannot
+run. The pattern is a regular expression by default and case-insensitive unless you ask
+otherwise.
 
 Usage: oculus grep [OPTIONS] <PATTERN>
 
@@ -342,6 +342,10 @@ Arguments:
 Options:
   -s, --subject <SUBJECT_CODE>
           Restrict to these subjects; prefix codes are fine. Repeatable
+
+  -c, --category <CATEGORY>
+          Only these categories (home, syllabus, upload, page, assignment, quiz,
+          announcement, ed, file, module, image, other). Repeatable
 
   -F, --fixed
           Treat the pattern as literal text, not a regular expression
@@ -410,8 +414,8 @@ Options:
           Only this extension (pdf, md, pptx, docx, png …)
 
   -c, --category <CATEGORY>
-          Only this Canvas category (file, page, announcement, ed, module, assignment,
-          quiz, syllabus, home, image)
+          Only these categories (home, syllabus, upload, page, assignment, quiz,
+          announcement, ed, file, module, image, other). Repeatable
 
   -m, --match <TEXT>
           Only paths containing this text (case-insensitive)
@@ -606,15 +610,16 @@ Options:
 ## `oculus task`
 
 ```
-Add, move, finish and delete the tasks on a project's board
+Add, move, refile, finish and delete tasks, on a board or on none
 
 Usage: oculus task <COMMAND>
 
 Commands:
-  list    List a project's tasks
+  list    List tasks — one project's, or every task there is
   add     Add one task, or a whole breakdown in one call
   update  Change a task's title, notes, dates or estimate
   move    Move a task to another column, or reorder it within one
+  refile  File a task under another project, or under none at all
   rm      Delete a task, and its subtasks with it
   help    Print this message or the help of the given subcommand(s)
 
@@ -626,19 +631,28 @@ Options:
 ### `oculus task list`
 
 ```
-List a project's tasks.
+List tasks — one project's, or every task there is.
 
 Grouped by column in the board's order, subtasks under their parent. A task sitting in a
 `done` column carries the time it landed there.
 
-Usage: oculus task list [OPTIONS] --project <ID>
+Without `-p` this spans **every** project and includes the tasks that belong to none,
+printed as one board per project under its name, with the unfiled ones first.
+`--unfiled` lists only those: the pile with no board of its own, which is the one that
+needs looking at.
+
+Usage: oculus task list [OPTIONS]
 
 Options:
   -p, --project <ID>
-          Which project
+          Which project (omit for every task in the library)
+
+      --unfiled
+          Only tasks that belong to no project at all
 
   -c, --column <ID>
-          Only this board column (its id, e.g. todo)
+          Only this board column (its id, e.g. todo) — needs --project, since a column
+          id only means something against one board
 
       --due-before <ISO>
           Only tasks due before this ISO 8601 timestamp. Compared as text, so pass the
@@ -653,11 +667,18 @@ Options:
 ```
 Add one task, or a whole breakdown in one call.
 
-A task lands at the end of its column; without `--column` that is the project's first
-one. The column id is checked against the project's board and an unknown one is refused,
-listing the ids the board does have — a task filed under a column that does not exist is
-drawn by nothing, in any view. Landing in a `done` column marks the task finished,
-exactly as moving it there would.
+**Without `-p` the task belongs to no project at all** — the same thing the app's Tasks
+page writes by default, and the answer to "write this down, I have not decided where it
+goes". That is the absence of a project, not a project called Inbox, so nothing needs
+cleaning up if it is never filed; `oculus task refile` files it later. Its board is the
+default one (`backlog`, `todo`, `doing`, `done`), so filing it into a project created by
+this binary needs no translation.
+
+A task lands at the end of its column; without `--column` that is the first column of
+its board. The column id is checked against that board and an unknown one is refused,
+listing the ids it does have — a task filed under a column that does not exist is drawn
+by nothing, in any view. Landing in a `done` column marks the task finished, exactly as
+moving it there would.
 
 `--parent` makes the task a subtask. Subtasks are one level deep: a subtask cannot
 itself be given children.
@@ -681,7 +702,7 @@ board.
 
 Prints the new task ids in the order they were given.
 
-Usage: oculus task add [OPTIONS] --project <ID> [TITLE]
+Usage: oculus task add [OPTIONS] [TITLE]
 
 Arguments:
   [TITLE]
@@ -689,10 +710,10 @@ Arguments:
 
 Options:
   -p, --project <ID>
-          Which project
+          Which project (omit to file it nowhere)
 
   -c, --column <ID>
-          Board column id (default: the project's first column)
+          Board column id (default: the first column of its board)
 
       --parent <TASK_ID>
           Make this a subtask of that task id
@@ -787,6 +808,42 @@ Options:
           Print help (see a summary with '-h')
 ```
 
+### `oculus task refile`
+
+```
+File a task under another project, or under none at all.
+
+The one command that changes which project a task belongs to. It takes the task's
+**subtasks with it** — a subtask sits in its parent's project, so there is no honest
+half of this move, and a subtask on its own is refused and names its parent instead.
+
+The column maps across by *kind*: a task in a column that means "in flight" lands in the
+**first** column of that kind on the destination's board, so entering a kind puts you at
+its start. A board with no column of that kind — no Done column for a finished task — is
+refused rather than given the nearest one; there is no nearest kind. Whether the task is
+finished follows the column it lands in, as it does everywhere else.
+
+It lands at the **end** of that column: `position` is an order inside one project's
+column and means nothing across two, so there is no slot in the destination to aim at.
+`oculus task move` is how it is then placed.
+
+Usage: oculus task refile [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          Task id
+
+Options:
+  -p, --project <ID>
+          File it under this project
+
+      --unfiled
+          Take it out of every project instead
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
 ### `oculus task rm`
 
 ```
@@ -816,7 +873,7 @@ Usage: oculus lecture <COMMAND>
 Commands:
   candidates  Find where a recording plausibly changes topic
   chapters    Name a recording's chapters with a CLI agent, and store them
-  recap       Write a slide-by-slide recap of a recording with a CLI agent
+  reading     Write a recording's reading copy with a CLI agent
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -848,6 +905,10 @@ Options:
           Also write one JPEG per candidate into the lecture's `frames/` folder, so the
           boundaries can be checked by eye
 
+      --source <N>
+          Which captured stream to read — 1 or 2. Default: source 1, unless it turns out
+          to be dead, in which case source 2 if it is downloaded
+
   -h, --help
           Print help (see a summary with '-h')
 ```
@@ -875,7 +936,7 @@ Options:
   -p, --provider <PROVIDER>
           Which CLI to drive (default: the configured one)
 
-          [possible values: claude, codex]
+          [possible values: claude, codex, opencode]
 
   -m, --model <MODEL>
           Model to request (default: the configured one)
@@ -886,24 +947,30 @@ Options:
       --force
           Re-run over a lecture that already has chapters, replacing them
 
+      --source <N>
+          Which captured stream to read — 1 or 2. Default: source 1, unless it turns out
+          to be dead, in which case source 2 if it is downloaded
+
   -h, --help
           Print help (see a summary with '-h')
 ```
 
-### `oculus lecture recap`
+### `oculus lecture reading`
 
 ```
-Write a slide-by-slide recap of a recording with a CLI agent
+Write a recording's reading copy with a CLI agent
 
-Splits the lecture at its visual changes, groups those segments into roughly ten-minute
-windows, and asks a coding agent to describe what the slide shows and what the lecturer
-says over it. Each window is validated and written before the next starts, so a long run
-has useful partial results if a later window fails.
+Rewrites the transcript as text a student can read: one sentence per line, each pinned
+to the second it was said, with spoken maths set as maths and speech-recognition errors
+fixed from the slide. The lecture is split at its slide changes — which become paragraph
+breaks — and grouped into roughly ten-minute windows, one agent turn each. Each window
+is validated and written before the next starts, so a long run has useful partial
+results if a later window fails.
 
-Unlike chapter naming, this needs the transcript: a recap is about the explanation as
-well as the slide. The recording and transcript must both have been downloaded first.
+Unlike chapter naming, this needs the transcript: the reading copy is the transcript,
+rewritten. The recording and transcript must both have been downloaded first.
 
-Usage: oculus lecture recap [OPTIONS] <LECTURE_ID>
+Usage: oculus lecture reading [OPTIONS] <LECTURE_ID>
 
 Arguments:
   <LECTURE_ID>
@@ -913,7 +980,7 @@ Options:
   -p, --provider <PROVIDER>
           Which CLI to drive (default: the configured one)
 
-          [possible values: claude, codex]
+          [possible values: claude, codex, opencode]
 
   -m, --model <MODEL>
           Model to request (default: the configured one)
@@ -922,7 +989,11 @@ Options:
           Reasoning effort — low, medium, high, xhigh, max (default: the configured one)
 
       --force
-          Re-run over a lecture that already has recap notes, replacing them
+          Re-run over a lecture that already has a reading copy, replacing it
+
+      --source <N>
+          Which captured stream to read — 1 or 2. Default: source 1, unless it turns out
+          to be dead, in which case source 2 if it is downloaded
 
   -h, --help
           Print help (see a summary with '-h')
@@ -960,8 +1031,8 @@ Run one prompt through a CLI agent and print what it does.
 The same bridges the app's chat uses, without the window: the agent runs from the
 library's agents/ folder with the app's instructions appended, can read the whole
 library and write only there, and its normalized events are printed as they arrive.
-Needs the provider's CLI installed and signed in (`claude` or `codex`). Nothing is
-recorded in the database; this is for checking a bridge works.
+Needs the provider's CLI installed and signed in (`claude`, `codex`, `opencode` or
+`agy`). Nothing is recorded in the database; this is for checking a bridge works.
 
 Usage: oculus agent [OPTIONS] <PROMPT>
 
@@ -974,7 +1045,7 @@ Options:
           Which CLI to drive
 
           [default: codex]
-          [possible values: claude, codex]
+          [possible values: claude, codex, opencode, antigravity]
 
   -m, --model <MODEL>
           Model to request (provider-specific name or alias)

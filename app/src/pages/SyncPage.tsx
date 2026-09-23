@@ -1,3 +1,4 @@
+import { SUBJECT_SELECTION_CHANGED_EVENT, subjectSelectionWrites } from "@/lib/subjectSelection";
 import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import {
   WarningCircle,
@@ -19,20 +20,21 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import {
-  getDb,
   upsertSubjects,
   getSubjects,
   getSyncRunSummaries,
   getPdfPipelineRows,
+  getEmbedCoverage,
+  getFileByRelativePath,
   setParseStatusByPath,
   addLog,
   type CanvasCourseRaw,
   type Subject,
   type SyncRunSummary,
 } from "@/lib/db";
-import { embedFile, embedPending } from "@/lib/retrieval";
 import { triggerSync } from "@/lib/syncRunner";
-import { SUBJECT_SELECTION_CHANGED_EVENT, subjectSelectionWrites } from "@/lib/subjectSelection";
+import { embeddingStats } from "@/lib/retrieval";
+import { useIndexStore } from "@/stores/indexStore";
 import { fmtAgo, sqliteUtcToMs } from "@/lib/format";
 import { useAuth } from "@/hooks/useAuth";
 import { useSyncStore } from "@/stores/syncStore";
@@ -62,7 +64,10 @@ const VIEW_KEY = "oculus-sync-view";
  *  opening anything. */
 const VIEWS = [
   { value: "history", label: "Sync History" },
-  { value: "pipeline", label: "Parse Activity" },
+  // "Parse Activity" while parsing was the only stage worth watching. The
+  // table walks download → parse → embed now, and naming it after one stage
+  // would send someone looking elsewhere for the other two.
+  { value: "pipeline", label: "File Activity" },
 ] as const satisfies ReadonlyArray<{ value: ActivityView; label: string }>;
 
 export default function SyncPage() {
@@ -88,8 +93,9 @@ export default function SyncPage() {
   const syncError = useSyncStore((s) => s.error);
   const scrapingRef = useRef(false);
 
-  // Pipeline (per-file download → parse → embed tracking).
+  // Pipeline (per-file download → parse tracking).
   const pipelineItems = usePipelineStore((s) => s.items);
+  const embedStage = usePipelineStore((s) => s.embedStage);
   const seedPipeline = usePipelineStore((s) => s.seed);
   const clearFinished = usePipelineStore((s) => s.clearFinished);
 
@@ -142,7 +148,7 @@ export default function SyncPage() {
   }, [scraping]);
 
   // Backfill the pipeline table with every PDF on record, so the backlog
-  // (awaiting parse, awaiting embed) is visible even before anything runs.
+  // of files awaiting a parse is visible even before anything runs.
   // The DB's parse_status lags reality for files parsed before status
   // tracking existed (or by the CLI), so disk is consulted for anything the
   // DB doesn't already call fully parsed — and the DB is patched to match.
@@ -151,6 +157,16 @@ export default function SyncPage() {
       try {
         const rows = await getPdfPipelineRows();
         const byPath = new Map(rows.map((r) => [r.relative_path, r]));
+
+        // The embed stage is seeded from page coverage in the *current* space,
+        // never from `files.embed_status` — that column is a sticky flag with
+        // no memory of which model wrote the vectors, so after an engine
+        // change it claims 'done' over a library where nothing is searchable.
+        // Same question `getUnembeddedPdfs` asks, asked once for every row.
+        const { model, dim } = await embeddingStats();
+        const coverage = new Map(
+          (await getEmbedCoverage(model, dim)).map((c) => [c.relative_path, c]),
+        );
 
         const unsure = rows
           .filter((r) => r.parse_status !== "quality")
@@ -173,6 +189,8 @@ export default function SyncPage() {
             subjectId: r.subject_id,
             parseStatus: disk[r.relative_path] ?? r.parse_status,
             embedStatus: r.embed_status,
+            pagesTotal: coverage.get(r.relative_path)?.pages_total ?? 0,
+            pagesCurrent: coverage.get(r.relative_path)?.pages_current ?? 0,
             downloadedAt: sqliteUtcToMs(r.scraped_at),
             parsedAt: sqliteUtcToMs(r.parsed_at),
             embeddedAt: sqliteUtcToMs(r.embedded_at),
@@ -190,7 +208,7 @@ export default function SyncPage() {
   const counts = useMemo(() => {
     let active = 0, waiting = 0, paused = 0, failed = 0, done = 0;
     for (const it of items) {
-      const phase = statusOf(it).phase;
+      const phase = statusOf(it, embedStage).phase;
       if (phase === "active") active++;
       else if (phase === "waiting") waiting++;
       else if (phase === "paused") paused++;
@@ -198,7 +216,7 @@ export default function SyncPage() {
       else done++;
     }
     return { active, waiting, paused, failed, done };
-  }, [items]);
+  }, [items, embedStage]);
 
   // ── Auth events (cancelled, expired) ──────────────────────────────────────
 
@@ -294,64 +312,65 @@ export default function SyncPage() {
   };
 
   /**
-   * Pick the pipeline back up for one file, from whichever stage is
-   * outstanding. Parsing is idempotent on the sidecar side (fast is skipped
-   * when markdown exists, quality when its record exists), so "resume" and
-   * "retry" are the same call; a file that only lacks its embed goes straight
-   * to the embedder.
+   * Pick the pipeline back up for one file, at whichever stage it stopped.
+   *
+   * Both halves are idempotent on the Rust side — a file whose parse record
+   * exists is skipped, and so is one whose embedding record is already in the
+   * current space — so "resume" and "retry" are the same call either way. What
+   * the stage decides is *which* call: re-parsing a file whose parse is
+   * already done would be a no-op that left the embed it was actually waiting
+   * for exactly where it was.
    */
   const resumeItem = useCallback(async (it: PipelineItem) => {
     const { touch } = usePipelineStore.getState();
+    const embedding = it.parse === "done";
+
     // Clear paused/failed immediately so the row reads as moving again.
     touch(it.relativePath, it.subjectId, {
-      ...(it.quality === "error" ? { quality: "pending" as const } : {}),
+      ...(it.parse === "error" ? { parse: "pending" as const } : {}),
       ...(it.embed === "error" ? { embed: "pending" as const } : {}),
       error: undefined,
+      errorKind: undefined,
+      errorRetryable: undefined,
+      errorLatching: undefined,
     });
-    try {
-      if (it.quality !== "done") {
-        await invoke("parse_file", {
-          subjectId: it.subjectId,
-          subjectCode: it.code,
-          relativePath: it.relativePath,
+
+    if (embedding) {
+      // Into the same serial queue the Index button and auto-embed feed, so a
+      // hand-driven retry can never open a second run against the same
+      // per-minute ceiling. Rust narrates the rest over `embed-status`.
+      const file = await getFileByRelativePath(it.relativePath).catch(() => null);
+      if (!file) {
+        touch(it.relativePath, it.subjectId, {
+          embed: "error",
+          error: "This file is not in the database",
         });
-      } else if (it.embed !== "done") {
-        const db = await getDb();
-        const rows = await db.select<{ id: number }[]>(
-          `SELECT id FROM files WHERE subject_id = $1 AND relative_path = $2`,
-          [it.subjectId, it.relativePath],
-        );
-        const fileId = rows[0]?.id;
-        if (fileId == null) throw new Error("file not in the database");
-        await embedFile(fileId, it.relativePath);
+        return;
       }
+      useIndexStore.getState().enqueueFile(file);
+      return;
+    }
+
+    try {
+      await invoke("parse_file", {
+        subjectId: it.subjectId,
+        subjectCode: it.code,
+        relativePath: it.relativePath,
+      });
     } catch (e) {
-      touch(
-        it.relativePath,
-        it.subjectId,
-        it.quality !== "done"
-          ? { quality: "error", error: String(e) }
-          : { embed: "error", error: String(e) },
-      );
+      touch(it.relativePath, it.subjectId, { parse: "error", error: String(e) });
     }
   }, []);
 
-  /** Resume every paused row. Parses queue up in the sidecar; files that only
-   *  need an embed run through `embedPending`, which is serialised already. */
+  /** Resume every paused row; parses batch behind one another and embeds go
+   *  into the one serial queue. */
   const resumeAll = useCallback(() => {
     const all = Object.values(usePipelineStore.getState().items);
-    const { touch } = usePipelineStore.getState();
-    let needEmbed = false;
+    const on = usePipelineStore.getState().embedStage;
     for (const it of all) {
-      if (statusOf(it).phase !== "paused") continue;
-      if (it.quality !== "done") {
-        void resumeItem(it);
-      } else if (it.embed !== "done") {
-        touch(it.relativePath, it.subjectId, {});
-        needEmbed = true;
-      }
+      if (statusOf(it, on).phase !== "paused") continue;
+      void resumeItem(it);
     }
-    if (needEmbed) embedPending().catch((e) => console.error("resume embeds failed", e));
   }, [resumeItem]);
 
   const toggleSubject = (id: number) => {
@@ -369,7 +388,9 @@ export default function SyncPage() {
   // ── Derived ───────────────────────────────────────────────────────────────
 
   const phase = progress?.phase ? (PHASE_LABEL[progress.phase] ?? progress.phase) : null;
-  const finishedCount = items.filter((it) => isComplete(it) || hasFailed(it)).length;
+  const finishedCount = items.filter(
+    (it) => isComplete(it, embedStage) || hasFailed(it),
+  ).length;
   const lastCompleted = runs.find((r) => r.status === "completed" && r.finished_at);
   const needsAuth = authStatus !== "connected";
 

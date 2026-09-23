@@ -92,7 +92,7 @@ pub fn append_keepalive_log(data_dir: &std::path::Path, message: &str) {
 
 /// `YYYY-MM-DDTHH:MM:SS` from a Unix timestamp — civil-time arithmetic only, to
 /// keep a date crate out of a build that needs nothing else from one.
-fn iso8601_utc(secs: u64) -> String {
+pub fn iso8601_utc(secs: u64) -> String {
     let (days, rem) = (secs / 86_400, secs % 86_400);
     let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
 
@@ -113,6 +113,39 @@ fn iso8601_utc(secs: u64) -> String {
 
 pub fn db_path(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("oculus.db")
+}
+
+/// The database plus the two files SQLite keeps beside it in WAL mode.
+///
+/// This is the set a *writer* has to be able to open, and it is the one
+/// exception the harness's sandboxes make to "nothing outside `agents/` is
+/// writable": `oculus project` and `oculus task` are how an agent writes the
+/// student's board, and a process that may open `oculus.db` but not
+/// `oculus.db-wal` fails with SQLite's "attempt to write a readonly
+/// database" — measured under a seatbelt profile with only `agents/`
+/// writable, which is exactly what both bridges were handing the CLI.
+///
+/// Files, not the directory they sit in. Granting the directory would put the
+/// session cookie and the Ed token beside them inside the agent's reach, and
+/// the sidecars never need creating from in there: nothing runs an agent
+/// except the app and the CLI, and both hold the database open — which is
+/// what makes the two sidecars exist — for as long as the agent lives.
+pub fn db_write_paths(data_dir: &std::path::Path) -> Vec<PathBuf> {
+    let db = db_path(data_dir);
+    // MSIX can redirect only the database file. Match store::pool's physical
+    // filename before granting individual files to a native agent sandbox.
+    // A missing or conflicting journal must not expand the writable scope.
+    #[cfg(windows)]
+    let db = match crate::database::resolve_path(&db) {
+        Ok(db) => db,
+        Err(_) => return Vec::new(),
+    };
+    let sidecar = |suffix: &str| {
+        let mut p = db.clone().into_os_string();
+        p.push(suffix);
+        PathBuf::from(p)
+    };
+    vec![db.clone(), sidecar("-wal"), sidecar("-shm")]
 }
 
 // ── Course artifact paths ────────────────────────────────────────────────────
@@ -221,16 +254,17 @@ pub fn write_course_bytes(
     Ok((rel, content.len() as u64, action))
 }
 
-/// Delete everything a PDF-backed file leaves beside its PDF — `{stem}.md`,
-/// `{stem}.pages.json`, `{stem}.emb.json` and the `{stem}_images/` directory
-/// the markdown's figures live in.
+/// Delete the parse/embed artifacts a PDF-backed file leaves beside its PDF —
+/// `{stem}.md`, `{stem}.pages.json`, `{stem}.emb.json` and the `{stem}_images/`
+/// directory the markdown's figures live in. Both skip checks — `parse_mode`
+/// and `embed::is_embedded` — read those records rather than the PDF's bytes,
+/// so without this a re-scrape that finds changed bytes would keep serving the
+/// old parse and embeddings forever.
 ///
-/// The sidecar's skip checks are pure existence checks, so without this a
-/// re-scrape that finds changed bytes would keep serving the old parse and
-/// embeddings forever. The images go with them because they are only ever
-/// referenced *from* that markdown: leaving them is not a fallback, it is a
-/// directory of figures for a document that no longer says anything about
-/// them, and both parse tiers rebuild it from scratch anyway.
+/// The images go with them because they are only ever referenced *from* that
+/// markdown: leaving them is not a fallback, it is a directory of figures for
+/// a document that no longer says anything about them, and either engine
+/// rebuilds it from scratch anyway.
 ///
 /// `library_rel` is the library file, data-dir-relative (`courses/…`).
 pub fn purge_parse_artifacts(data_dir: &std::path::Path, library_rel: &str) {
@@ -288,31 +322,6 @@ pub fn doc_pdf_rel(rel: &str) -> Option<String> {
         .then(|| format!("{rel}.pdf"))
 }
 
-/// Which tier last parsed this PDF: `"quality"`, `"fast"`, or `None`.
-///
-/// Read from the sidecar's `{stem}.pages.json`, which is written only after a
-/// parse finishes. The `{stem}_images/` directory is NOT a usable signal — both
-/// tiers create it, and an interrupted run leaves one behind, which used to
-/// read as "quality done" and pin the file to fast markdown forever.
-pub fn parse_mode(pdf: &std::path::Path) -> Option<&'static str> {
-    if !pdf.with_extension("md").exists() {
-        return None;
-    }
-    let stem = pdf.file_stem()?.to_str()?;
-    let record = pdf.parent()?.join(format!("{stem}.pages.json"));
-
-    let mode = std::fs::read_to_string(&record)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v["mode"].as_str().map(str::to_string));
-
-    match mode.as_deref() {
-        Some("quality") => Some("quality"),
-        // Markdown with no readable record: report the weaker tier so the
-        // quality pass is still considered outstanding.
-        _ => Some("fast"),
-    }
-}
 
 /// The one directory inside a course folder the scraper never writes to: the
 /// student's own files, added by hand. Everything downstream — conversion,
@@ -339,6 +348,28 @@ pub fn is_upload_rel(rel: &str) -> bool {
         && safe_filename(parts[3]) == parts[3]
 }
 
+/// Every category `category_from_path` can return, in the order a reader
+/// meets them: the two whole-course documents, then the folders.
+///
+/// Held here rather than beside the callers so there is one list to keep in
+/// step with the match below — a CLI flag that validates against a copy of
+/// its own would go stale the first time a scraper grew a folder, and the
+/// test under it fails if the two drift.
+pub const CATEGORIES: &[&str] = &[
+    "home",
+    "syllabus",
+    "upload",
+    "page",
+    "assignment",
+    "quiz",
+    "announcement",
+    "ed",
+    "file",
+    "module",
+    "image",
+    "other",
+];
+
 pub fn category_from_path(path: &str) -> &'static str {
     match path {
         "home.md" => "home",
@@ -360,6 +391,25 @@ pub fn category_from_path(path: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn database_write_grants_use_the_resolved_file_and_fail_closed() {
+        let mut random = [0; 8];
+        getrandom::fill(&mut random).unwrap();
+        let root = std::env::temp_dir().join(format!("oculus-db-grants-{:016x}", u64::from_ne_bytes(random)));
+        std::fs::create_dir(&root).unwrap();
+        assert!(db_write_paths(&root).is_empty());
+        std::fs::write(root.join("oculus.db"), b"fixture").unwrap();
+        let physical = crate::database::resolve_path(&root.join("oculus.db")).unwrap();
+        let grants = db_write_paths(&root.join("."));
+        assert_eq!(grants[0], physical);
+        assert_eq!(grants[1], PathBuf::from(format!("{}-wal", physical.display())));
+        assert_eq!(grants[2], PathBuf::from(format!("{}-shm", physical.display())));
+        assert!(!grants.contains(&root));
+        std::fs::remove_file(root.join("oculus.db")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
     #[test]
     fn timestamps_match_the_shell_agent_they_replaced() {
         // `date -u +%Y-%m-%dT%H:%M:%SZ` at these instants.
@@ -377,6 +427,37 @@ mod tests {
         assert_eq!(safe_rel_path("files/a.pdf").unwrap(), "files/a.pdf");
         assert_eq!(safe_rel_path("../../x").unwrap(), "x");
         assert!(safe_rel_path("///").is_none());
+    }
+
+    /// `CATEGORIES` is what a `--category` flag validates against, so a
+    /// category the scraper can write but the list has forgotten becomes a
+    /// well-formed query the CLI refuses. Walk one path per arm and insist
+    /// the answer is listed.
+    #[test]
+    fn every_category_the_scraper_writes_is_listed() {
+        let paths = [
+            "home.md",
+            "syllabus.md",
+            "uploads/notes.pdf",
+            "pages/week-01.md",
+            "assignments/a2.md",
+            "quizzes/mid.md",
+            "announcements/2026-07-14-welcome.md",
+            "ed/0001-teams.md",
+            "files/week-01.pdf",
+            "modules/01-intro.md",
+            "images/fig-3.png",
+            "something-nobody-planned-for",
+        ];
+        for p in paths {
+            let c = category_from_path(p);
+            assert!(CATEGORIES.contains(&c), "{p} -> {c:?} is not in CATEGORIES");
+        }
+        // And nothing in the list is unreachable: every entry was just hit.
+        let hit: Vec<&str> = paths.iter().map(|p| category_from_path(p)).collect();
+        for c in CATEGORIES {
+            assert!(hit.contains(c), "{c:?} is listed but no path produces it");
+        }
     }
 
     #[test]

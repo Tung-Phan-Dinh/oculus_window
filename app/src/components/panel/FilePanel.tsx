@@ -4,14 +4,10 @@ import { useActivePath } from "@/stores/tabStore";
 import { useSubjectFiles } from "@/hooks/useSubjectFiles";
 import { PanelHeader } from "@/components/panel/PanelHeader";
 import { FileViewer, PdfMdToggle, usePdfMd } from "@/components/files/FileViewer";
-import { fileTitle, openFileSmart } from "@/lib/openFile";
+import { MarkdownUnavailable } from "@/components/files/ParseState";
+import { filePagePath, fileTitle, openFileSmart } from "@/lib/openFile";
 import { recordRecent } from "@/lib/recents";
 import type { DbFile } from "@/lib/db";
-
-/** Builds the full-page route for a file. */
-export function filePagePath(subjectId: number, relativePath: string): string {
-  return `/subjects/${subjectId}/file?path=${encodeURIComponent(relativePath)}`;
-}
 
 /**
  * A file open in the side panel. Expanding promotes it to a full page —
@@ -21,11 +17,11 @@ export function filePagePath(subjectId: number, relativePath: string): string {
  */
 export default function FilePanel({
   file,
-  tabId,
+  paneId,
   onExpand,
 }: {
   file: DbFile;
-  tabId: number;
+  paneId: number;
   onExpand: (path: string, newTab: boolean) => void;
 }) {
   const { files } = useSubjectFiles(file.subject_id);
@@ -39,8 +35,8 @@ export default function FilePanel({
   // background tab that comes forward is still sitting where it was left.
   useEffect(() => {
     const m = /^\/subjects\/(\d+)/.exec(here);
-    if (!m || m[1] !== String(file.subject_id)) close(tabId);
-  }, [here, file.subject_id, close, tabId]);
+    if (!m || m[1] !== String(file.subject_id)) close(paneId);
+  }, [here, file.subject_id, close, paneId]);
 
   // Feeds the "Recently visited" row on the subject home.
   useEffect(() => {
@@ -59,10 +55,16 @@ export default function FilePanel({
         onExpand={(newTab) =>
           onExpand(filePagePath(file.subject_id, file.relative_path), newTab)
         }
-        onClose={() => close(tabId)}
+        onClose={() => close(paneId)}
         actions={
-          pdf.isPdf && pdf.mdExists ? (
-            <PdfMdToggle value={pdf.viewMode} onChange={pdf.setViewMode} />
+          /* Same pairing as the full page: the toggle when there is markdown,
+             the reason there is none when there is not. */
+          pdf.isPdf && pdf.mdChecked ? (
+            pdf.mdExists ? (
+              <PdfMdToggle value={pdf.viewMode} onChange={pdf.setViewMode} />
+            ) : (
+              <MarkdownUnavailable file={file} />
+            )
           ) : undefined
         }
       />

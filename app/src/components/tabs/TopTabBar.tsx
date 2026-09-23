@@ -1,3 +1,4 @@
+import { isMac, shortcut } from "@/lib/platform";
 import { Fragment, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -5,11 +6,11 @@ import {
   CaretRight,
   Plus,
   Sidebar,
+  SidebarSimple,
   X,
 } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
-import { isMac, shortcut } from "@/lib/platform";
-import { useTabStore } from "@/stores/tabStore";
+import { focusedPane, useTabStore } from "@/stores/tabStore";
 import { useBrowserStore } from "@/stores/browserStore";
 import { browser, browseId } from "@/lib/browser";
 import { useSubjects } from "@/hooks/useSubjects";
@@ -24,8 +25,9 @@ import { useWindowFullscreen } from "@/hooks/useWindowFullscreen";
 import { ownsPlayback } from "@/lib/lecturePlayback";
 import { confirmLeavingLecture } from "@/stores/leaveLectureStore";
 
-/** Where a tab opened from the + button or ⌘T starts. */
-const NEW_TAB_PATH = "/subjects";
+/** Where a tab opened from the + button or ⌘T starts:
+ *  `app/src/pages/NewTabPage.tsx`, which asks where you are going. */
+const NEW_TAB_PATH = "/new";
 
 /** Width of the column between two tabs: their visual gap, and the extra
  *  distance a tab travels when it swaps places with a neighbour. */
@@ -61,9 +63,11 @@ export default function TopTabBar({
   sidebarCollapsed,
   onToggleSidebar,
 }: TopTabBarProps) {
-  const { tabs, activeId, addTab, setActive, closeTab } = useTabStore();
+  const { tabs, activeId, addTab, setActive, closeTab, toggleSplit, reopenTab } =
+    useTabStore();
   const { subjects } = useSubjects();
   const browserTabs = useBrowserStore((s) => s.tabs);
+  const favicons = useBrowserStore((s) => s.favicons);
   const fullscreen = useWindowFullscreen();
   const [hoveredId, setHoveredId] = useState<number | null>(null);
   const tabRefs = useRef(new Map<number, HTMLDivElement>());
@@ -107,15 +111,31 @@ export default function TopTabBar({
           ),
         );
 
-  // While a browser tab is in front, the arrows are the page's history, not
-  // the router's — as they would be in a browser. Whether the page has
-  // anywhere to go is not knowable from outside it, so they stay enabled.
-  // For an app tab the answer comes from the tab itself: its pane keeps its
-  // own history index, since a memory router has no `window.history` to read.
+  // While a browser page is in front, the arrows are the page's history, not
+  // the router's — as they would be in a browser. Whether that page has
+  // anywhere to go is a question only the page can answer, so Rust reads its
+  // back/forward list after every load and the answer rides in the snapshot
+  // (`can_back`/`can_forward`); before that landed the arrows simply stayed
+  // lit, which meant the back arrow on a page you had just opened was an
+  // offer the page could not keep.
+  // For an app page the answer comes from the pane itself: each keeps its own
+  // history index, since a memory router has no `window.history` to read.
+  //
+  // Asked of the *focused* half, which is the same half the sidebar highlights
+  // and ⌘K navigates — one answer to "where am I", however the tab is split.
   const activeTab = tabs.find((t) => t.id === activeId);
-  const activeBrowse = browseId(activeTab?.path);
-  const canGoBack = activeBrowse != null || !!activeTab?.canBack;
-  const canGoForward = activeBrowse != null || !!activeTab?.canForward;
+  const activePane = activeTab && focusedPane(activeTab);
+  const activeBrowse = browseId(activePane?.path);
+  const activeBrowseTab =
+    activeBrowse != null
+      ? browserTabs.find((t) => t.id === activeBrowse)
+      : undefined;
+  const canGoBack =
+    activeBrowse != null ? !!activeBrowseTab?.can_back : !!activePane?.canBack;
+  const canGoForward =
+    activeBrowse != null
+      ? !!activeBrowseTab?.can_forward
+      : !!activePane?.canForward;
   const go = (delta: 1 | -1) => {
     if (activeBrowse != null)
       browser.history(activeBrowse, delta).catch(() => {});
@@ -134,6 +154,18 @@ export default function TopTabBar({
   const close = (id: number) => {
     const bid = browseId(tabs.find((t) => t.id === id)?.path);
     if (bid != null) {
+      // Remember the page here rather than in `closeTab`: the route is about
+      // to name a WebView that no longer exists, and by the time the snapshot
+      // comes back and closes the pane, Rust has already dropped the tab whose
+      // URL is the only thing worth keeping.
+      const url = browserTabs.find((t) => t.id === bid)?.url;
+      if (url)
+        useTabStore.getState().remember({
+          index: tabs.findIndex((t) => t.id === id),
+          path: null,
+          url,
+          split: null,
+        });
       browser.close(bid).catch(() => {});
       return;
     }
@@ -144,15 +176,51 @@ export default function TopTabBar({
   };
 
   const newTab = () => addTab(NEW_TAB_PATH);
+  const split = () => toggleSplit(activeId);
+  // ⌘1…⌘8 are positions in the strip, and a position the strip does not have
+  // is nothing — not the nearest tab, which would land you somewhere you did
+  // not ask for and have to look at to find out where.
+  const selectTab = (index: number) => {
+    const tab = tabs[index];
+    if (tab) switchTo(tab.id);
+  };
+  // ⌘9 is the *last* tab rather than the ninth, which is what Chrome and
+  // Safari do with it: it is the one number that keeps its meaning once the
+  // strip is longer than the keyboard counts.
+  const selectLastTab = () => {
+    const tab = tabs[tabs.length - 1];
+    if (tab) switchTo(tab.id);
+  };
+  const splitOpen = !!activeTab?.split;
 
-  // ⌘T and ⌘W arrive as menu events rather than key presses: macOS hands the
-  // menu bar every ⌘-key before a webview sees it, so they can only be menu
-  // items (`app/src-tauri/src/menu.rs`) — which is also what makes them work
-  // while a browser tab's native page holds focus and the app's own webview
-  // is getting no keys at all. The strip does the work either way.
-  const menuActions = useRef({ newTab, closeActive: () => {} });
+  // ⌘T, ⌘W and ⌥⌘T arrive as menu events rather than key presses: macOS hands
+  // the menu bar every ⌘-key before a webview sees it, so they can only be
+  // menu items (`app/src-tauri/src/menu.rs`) — which is also what makes them
+  // work while a browser page's native WebView holds focus and the app's own
+  // webview is getting no keys at all. That matters most for the split: a page
+  // in one half is exactly when you reach for the other. The strip does the
+  // work either way.
+  // ⌘[ and ⌘] are here for the same reason and route through the same `go`
+  // the arrows do, so "back" means one thing however it was asked for. So are
+  // ⌘1…⌘9 and ⇧⌘T, and for them the browser case is the point twice over: a
+  // page you are reading is exactly when you want the tab you came from back,
+  // and a page you just closed is exactly what ⇧⌘T is for.
+  const menuActions = useRef({
+    newTab,
+    split,
+    reopenTab,
+    closeActive: () => {},
+    selectTab: (_: number) => {},
+    selectLastTab: () => {},
+    go: (_: 1 | -1) => {},
+  });
   menuActions.current = {
     newTab,
+    split,
+    go,
+    reopenTab,
+    selectTab,
+    selectLastTab,
     closeActive: () => {
       const tab = tabs.find((t) => t.id === activeId);
       // The same rule the × follows: a sole app tab doesn't offer one,
@@ -166,6 +234,14 @@ export default function TopTabBar({
     const pending = [
       listen("menu-new-tab", () => menuActions.current.newTab()),
       listen("menu-close-tab", () => menuActions.current.closeActive()),
+      listen("menu-reopen-tab", () => menuActions.current.reopenTab()),
+      listen<number>("menu-select-tab", (e) =>
+        menuActions.current.selectTab(e.payload),
+      ),
+      listen("menu-last-tab", () => menuActions.current.selectLastTab()),
+      listen("menu-split", () => menuActions.current.split()),
+      listen("menu-back", () => menuActions.current.go(-1)),
+      listen("menu-forward", () => menuActions.current.go(1)),
     ];
     return () => {
       for (const p of pending) p.then((un) => un()).catch(() => {});
@@ -304,7 +380,13 @@ export default function TopTabBar({
         {tabs.map((tab, i) => {
           const active = tab.id === activeId;
           const hovered = tab.id === hoveredId;
-          const { title, icon } = tabInfo(tab.path, subjects, browserTabs);
+          const { title, icon } = tabInfo(
+            tab.path,
+            subjects,
+            browserTabs,
+            13,
+            favicons,
+          );
           // Chrome-style: a small vertical separator between two inactive
           // neighbours, hidden next to the active or hovered tab.
           const prev = tabs[i - 1];
@@ -454,6 +536,38 @@ export default function TopTabBar({
         {/* Remaining space stays draggable. */}
         <div data-tauri-drag-region className="flex-1 h-full" />
       </div>
+
+      {/* Split toggle, at the far end of the bar rather than beside the +:
+          it acts on the tab in front, not on the strip, and sitting among the
+          tabs would read as making another one. Outside the measured strip,
+          so the tabs divide up what is left of the bar without it. */}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            onClick={split}
+            aria-label={splitOpen ? "Close sidepanel" : "Open sidepanel"}
+            aria-pressed={splitOpen}
+            className={cn(
+              barButton,
+              // Lit the way the sidebar lights an active row, not filled: a
+              // solid glyph at this size reads as a pause button.
+              splitOpen && "bg-sidebar-item-active text-foreground",
+            )}
+          >
+            {/* The sidebar toggle's glyph, mirrored: the same idea on the
+                other edge, and it reads as "a panel over there" where a
+                two-column icon at 16px reads as a pause button. */}
+            <SidebarSimple size={17} className="scale-x-[-1]" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent
+          side="bottom"
+          className="flex flex-col items-start gap-0.5"
+        >
+          {splitOpen ? "Close sidepanel" : "Open sidepanel"}
+          <span className="text-[11px] text-background/60">{shortcut("T", true)}</span>
+        </TooltipContent>
+      </Tooltip>
     </div>
   );
 }

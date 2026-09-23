@@ -4,24 +4,19 @@ import { ClockCounterClockwise, NotePencil } from "@phosphor-icons/react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { ProviderMark } from "@/components/harness/ProviderMark";
 import { Timeline } from "@/components/harness/Timeline";
-import { type PickerProvider } from "@/components/harness/ModelPicker";
 import { LectureChatComposer } from "@/components/lectures/LectureChatComposer";
+import { useProviderModels } from "@/hooks/useProviderModels";
 import { useStickToBottom } from "@/hooks/useStickToBottom";
-import { useHarnessProviders } from "@/hooks/useHarnessProviders";
 import { fmtAgo, sqliteUtcToMs } from "@/lib/format";
 import {
-  CLAUDE_MODELS,
-  codexAsModels,
   defaultSelection,
   getLectureThreads,
-  harnessCodexModels,
   harnessEditQueued,
   harnessEditResend,
   harnessInterrupt,
   harnessRewind,
   harnessSend,
   harnessUnqueue,
-  type CodexModel,
   type HarnessThread,
   type Provider,
 } from "@/lib/harness";
@@ -56,9 +51,10 @@ export interface LectureChatPanelProps {
   atRef: RefObject<number>;
   /**
    * The moment, built by the player: the transcript of the minute before, the
-   * chapter the playhead is in, and the frame grab. Null when there is nothing
-   * to say about this second. It never throws — a lecture with no downloaded
-   * video has no frame, and a message must still go.
+   * chapter the playhead is in, and a frame of every stream the capture has
+   * downloaded. Null when there is nothing to say about this second. It never
+   * throws — a lecture with no downloaded video has no frame, and a message
+   * must still go.
    */
   buildMoment: (at: number) => Promise<string | null>;
 }
@@ -85,7 +81,6 @@ export const LectureChatPanel = memo(function LectureChatPanel({
   buildMoment,
 }: LectureChatPanelProps) {
   const store = useHarnessStore;
-  const providers = useHarnessProviders();
 
   // Resolved from `dockThread` if this lecture has been talked to this
   // session, otherwise from its most recent thread. `resolved` is what keeps
@@ -97,7 +92,6 @@ export const LectureChatPanel = memo(function LectureChatPanel({
   /** This lecture's threads, for the history popover and for the title before
    *  the store's own list has been read. */
   const [threads, setThreads] = useState<HarnessThread[]>([]);
-  const [codexModels, setCodexModels] = useState<CodexModel[] | null>(null);
   const [moment, setMoment] = useState(true);
   /** Words a stop handed back. Local rather than the store's `restore`, which
    *  is one field with no thread on it: a stop in the dock would otherwise
@@ -171,19 +165,13 @@ export const LectureChatPanel = memo(function LectureChatPanel({
     };
   }, [store, threadId]);
 
-  useEffect(() => {
-    if (activeProvider !== "codex" || codexModels) return;
-    harnessCodexModels().then(setCodexModels).catch(() => setCodexModels([]));
-  }, [activeProvider, codexModels]);
+  // The dock's picker shows the thread's own agent, so that is the one whose
+  // CLI is worth asking for a catalogue.
+  const { providers: pickerProviders } = useProviderModels(activeProvider);
 
-  const pickerProviders: PickerProvider[] = providers.map((p) =>
-    p.id === "claude"
-      ? { ...p, models: CLAUDE_MODELS }
-      : { ...p, models: codexAsModels(codexModels ?? []), loading: codexModels === null },
-  );
-
-  // No turn goes out without a model and a level, so an empty selection —
-  // Codex before its CLI has answered — is filled the moment a list exists.
+  // No turn goes out without a model and a level, so an empty selection — a
+  // fetched catalogue before its CLI has answered — is filled the moment a
+  // list exists.
   const active = pickerProviders.find((p) => p.id === activeProvider);
   useEffect(() => {
     if (model || !active || active.unavailableReason || active.loading || active.models.length === 0) return;
@@ -212,9 +200,10 @@ export const LectureChatPanel = memo(function LectureChatPanel({
       // Read the playhead now, not at the last render: the second this says is
       // the second the bubble will carry.
       const at = moment ? Math.max(0, Math.floor(atRef.current)) : null;
-      // A frame grab that cannot happen — no downloaded recording — drops the
-      // frame line and nothing else. Failing the message over a picture would
-      // be the wrong half to lose.
+      // A frame grab that cannot happen — no downloaded recording, or one
+      // stream of two that will not decode — drops that line and nothing
+      // else. Failing the message over a picture would be the wrong half to
+      // lose.
       const context = at == null ? null : await buildMoment(at);
       try {
         const newId = await harnessSend(id, activeProvider, text, {
@@ -370,7 +359,10 @@ export const LectureChatPanel = memo(function LectureChatPanel({
         </button>
       </div>
 
-      <div ref={scroll.outer} className="min-h-0 flex-1 overflow-y-auto px-2">
+      {/* `overflow-x-hidden`: `overflow-y: auto` computes the x axis to
+          `auto` too, and this column is 300px — one row that will not narrow
+          took the whole conversation sideways with it. See `RowShell`. */}
+      <div ref={scroll.outer} className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-2">
         <div ref={scroll.inner} className="min-w-0 py-1">
           {empty ? (
             // The provider mark and one line. No suggestion chips: the dock is

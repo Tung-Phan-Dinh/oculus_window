@@ -24,7 +24,7 @@ export const useHarnessHealthStore = create<HarnessHealthState>((set, get) => ({
     if (state.checking || (!force && Date.now() - state.checkedAt < RECHECK_AFTER_MS)) return;
     set({ checking: true });
     try {
-      set({ health: await harnessHealth(), error: null, checkedAt: Date.now() });
+      set({ health: await harnessHealth(force), error: null, checkedAt: Date.now() });
     } catch (error) {
       set({ error: `Could not check CLI agents: ${String(error)}`, checkedAt: Date.now() });
     } finally {

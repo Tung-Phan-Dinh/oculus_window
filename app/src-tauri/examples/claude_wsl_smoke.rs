@@ -54,11 +54,11 @@ fn turn(harness: &Harness, events: &Events, resume: Option<&str>, prompt: &str, 
                     interrupted = true;
                 }
             }
-            HarnessEvent::ToolFinished { id, ok, output } => {
+            HarnessEvent::ToolFinished { id, ok, output, .. } => {
                 if cli_tools.contains(&id) && ok && output.contains("oculus 0.1.0") { result.cli_succeeded = true; }
             }
             HarnessEvent::TurnFinished { status } => { result.status = status; break; }
-            HarnessEvent::Error { message } => return Err(message),
+            HarnessEvent::Error { message, .. } => return Err(message),
             HarnessEvent::Exited { code } => return Err(format!("Claude exited before turn completion: {code:?}")),
             _ => {}
         }

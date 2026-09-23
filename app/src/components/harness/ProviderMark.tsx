@@ -1,8 +1,8 @@
-import type { SVGProps } from "react";
+import type { ComponentType, SVGProps } from "react";
 import type { Provider } from "@/lib/harness";
 
 /**
- * Vendor marks for the two CLI agents the harness drives. Both are
+ * Vendor marks for the CLI agents the harness drives. All of them are
  * `currentColor` monochrome — the same treatment bb gives them under its
  * per-provider `icons` folders — so they sit in the quiet palette like any
  * other icon and never fight the indigo accent. The caller sizes them with a
@@ -37,12 +37,84 @@ export function CodexMark(props: SVGProps<SVGSVGElement>) {
   );
 }
 
+/**
+ * opencode's own mark, which is the only two-tone one of the three: a heavy
+ * rectangular frame with a block filling the lower two-thirds of its opening —
+ * a cursor sitting in a terminal.
+ *
+ * **Both halves are `currentColor`; the inner block is the same ink at a
+ * fraction of its alpha.** The vendor ships a light and a dark file, and the
+ * difference between them is only that each is composed against its own
+ * background: measured off the two, the inner block is the outer colour at
+ * α≈0.21 over the page in both. Carrying two SVGs to say that would also cost
+ * the thing every mark here has — one colour, inherited — so the ratio is
+ * expressed as an opacity and the theme takes care of itself. It is set a
+ * little heavier than measured because these are drawn at 14px in ink that is
+ * already `muted-foreground` at 60–70% opacity, where a true 21% block
+ * disappears into the surface.
+ *
+ * Its viewBox is 4:5 where the other two are square, so it letterboxes inside
+ * the caller's `size-` box rather than being stretched to match them.
+ */
+export function OpencodeMark(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 240 300"
+      fill="currentColor"
+      aria-hidden
+      {...props}
+    >
+      <path fillRule="evenodd" d="M0 0h240v300H0V0Zm60 60v180h120V60H60Z" />
+      <path d="M60 120h120v120H60z" fillOpacity={0.35} />
+    </svg>
+  );
+}
+
+/**
+ * Antigravity's mark: the product's own device, a ring with a chevron rising
+ * out of it — a thing leaving a gravity well.
+ *
+ * One `currentColor` path like Claude's and Codex's rather than opencode's
+ * two-tone treatment, because the vendor's own mark is a single weight and
+ * there is no second value in it to express.
+ */
+export function AntigravityMark(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      aria-hidden
+      {...props}
+    >
+      <path
+        fillRule="evenodd"
+        d="M12 1.6a1 1 0 0 1 .84.46l4.3 6.72a1 1 0 0 1-1.68 1.08L13 5.55V14a1 1 0 1 1-2 0V5.55L8.54 9.86a1 1 0 1 1-1.68-1.08l4.3-6.72A1 1 0 0 1 12 1.6Z"
+      />
+      <path d="M4.6 14.2a1 1 0 0 1 1.32.5 6.67 6.67 0 0 0 12.16 0 1 1 0 1 1 1.82.82 8.67 8.67 0 0 1-15.8 0 1 1 0 0 1 .5-1.32Z" />
+    </svg>
+  );
+}
+
+/**
+ * Every provider's mark, exhaustively.
+ *
+ * A `Record<Provider, …>` rather than a ternary on purpose: a ternary answered
+ * "not Claude" with the Codex mark, so a third agent would have drawn itself
+ * as Codex with nothing to catch it. Adding a provider to the union is a
+ * compile error here until its mark exists.
+ */
+const MARKS: Record<Provider, ComponentType<SVGProps<SVGSVGElement>>> = {
+  claude: ClaudeCodeMark,
+  codex: CodexMark,
+  opencode: OpencodeMark,
+  antigravity: AntigravityMark,
+};
+
 /** The mark for a provider — the tab strip, the trigger and the model rows
  *  all use it, so a thread's agent is readable at a glance. */
 export function ProviderMark({ provider, className }: { provider: Provider; className?: string }) {
-  return provider === "claude" ? (
-    <ClaudeCodeMark className={className} />
-  ) : (
-    <CodexMark className={className} />
-  );
+  const Mark = MARKS[provider];
+  return <Mark className={className} />;
 }

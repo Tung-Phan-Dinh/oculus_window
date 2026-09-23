@@ -2,20 +2,20 @@ import { useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
-  upsertFile, finishSyncRun, addLog,
+  setEmbedStatus, upsertFile, finishSyncRun, addLog,
   addSyncRunFile, getSyncOptions, markFileContentChanged, resetFilePipeline,
-  upsertLectures, replaceCalendarEvents,
+  upsertLectures, replaceCalendarEvents, getFileByRelativePath,
   type CalendarEventData, type LectureData, type SyncFileAction,
 } from "@/lib/db";
 import { useSyncStore } from "@/stores/syncStore";
 import { usePipelineStore } from "@/stores/pipelineStore";
+import { reportEmbedPages, useIndexStore } from "@/stores/indexStore";
+import { embedReady } from "@/lib/retrieval";
 import type { SyncProgress } from "@/stores/syncStore";
 import type { ParseJob } from "@/stores/parseStore";
-import { embedFile } from "@/lib/retrieval";
 import { isPdfBacked } from "@/lib/fileTypes";
 import { CALENDAR_UPDATED_EVENT } from "@/lib/calendar";
 import { notifyProjectsUpdated } from "@/lib/projects";
-import { getDb } from "@/lib/db";
 import { useHarnessStore } from "@/stores/harnessStore";
 import type { HarnessEnvelope } from "@/lib/harness";
 import { SCRAPED_FILE_FAILED_EVENT, SCRAPED_FILE_SAVED_EVENT, SyncWriteQueue } from "@/lib/syncWrites";
@@ -23,31 +23,23 @@ import { SCRAPED_FILE_FAILED_EVENT, SCRAPED_FILE_SAVED_EVENT, SyncWriteQueue } f
 import { queueParseEvent } from "@/lib/parseEvents";
 
 /**
- * Index a PDF right after it parses.
- *
- * Fire-and-forget: a failed embed must never block or fail the parse flow, and
- * `embedPending()` will retry it later. Serialised through one promise chain
- * because the sidecar holds a single model — firing these in parallel would
- * queue on the GPU anyway.
+ * The `embed-status` vocabulary, which is the parse one with the historical
+ * name taken out: the terminal success is `"done"`, because unlike
+ * `'quality'` it was never written into a library's worth of rows.
  */
-let embedChain: Promise<unknown> = Promise.resolve();
+const EMBED_STATUSES = new Set(["queued", "running", "done", "error"]);
 
-async function embedAfterParse(subjectId: number, relativePath: string) {
-  if (!isPdfBacked(relativePath)) return;
-  embedChain = embedChain.then(async () => {
-    try {
-      const db = await getDb();
-      const rows = await db.select<{ id: number }[]>(
-        `SELECT id FROM files WHERE subject_id = $1 AND relative_path = $2`,
-        [subjectId, relativePath],
-      );
-      const fileId = rows[0]?.id;
-      if (fileId == null) return;
-      await embedFile(fileId, relativePath);
-    } catch (e) {
-      console.error("embed after parse failed", relativePath, e);
-    }
-  });
+/** `embed-status`, exactly as `app/src-tauri/src/embed/events.rs` emits it. */
+interface EmbedJob {
+  relative_path: string;
+  subject_id: number;
+  status: string;
+  pages_done?: number;
+  total_pages?: number;
+  error?: string;
+  kind?: string;
+  retryable?: boolean;
+  latching?: boolean;
 }
 
 const isPipelinePdf = (path: string) => isPdfBacked(path);
@@ -76,6 +68,12 @@ export function useBackendEvents() {
       useSyncStore.getState().fail(message);
       pipeline().failStalledDownloads();
     };
+
+    // Is there an embedder behind the third stage? Asked once here, at the one
+    // place that is mounted for the life of the app, and re-asked by Settings
+    // → Library whenever a key is saved or cleared. Nothing is queued
+    // automatically while this is false — see `indexStore`.
+    void embedReady().then((ready) => useIndexStore.getState().setReady(ready));
 
     // ── CLI agents ──────────────────────────────────────────────────────────
     // App-level, not page-level: a thread keeps running while you are on
@@ -247,11 +245,83 @@ export function useBackendEvents() {
       }),
     );
 
-    // ── PDF parse + embed stage events ──────────────────────────────────────
+    // ── PDF parse stage events ──────────────────────────────────────────────
+    // One stage, emitted by Rust directly (there is no loopback IPC server and
+    // no sidecar any more). `"quality"` is the terminal success; see
+    // `parseEvents.ts` for the persisted vocabulary.
     unsubs.push(
       listen<ParseJob>("parse-status", (e) => {
-        void queueParseEvent(writes, useSyncStore.getState().runId, e.payload,
-          embedAfterParse, reportWriteFailure);
+        void queueParseEvent(writes, useSyncStore.getState().runId, e.payload, (_, path) => {
+          if (!useIndexStore.getState().ready) return;
+          void getFileByRelativePath(path).then((file) => {
+            if (file) useIndexStore.getState().enqueueFile(file);
+          }).catch((reason) => reportWriteFailure(`Could not queue ${path} for indexing: ${String(reason)}`));
+        }, reportWriteFailure);
+      }),
+    );
+
+    // ── Page embedding stage events ─────────────────────────────────────────
+    // The third stage, and the only one that reports progress *inside* a
+    // document on a clock measured in minutes per page. Same shape as
+    // `parse-status` deliberately — see `app/src-tauri/src/embed/events.rs`.
+    unsubs.push(
+      listen<EmbedJob>("embed-status", async (e) => {
+        const ev = e.payload;
+        const path = ev.relative_path;
+        if (!path || !EMBED_STATUSES.has(ev.status)) return;
+
+        void writes.enqueue(useSyncStore.getState().runId, `Saving embed status for ${path}`, async () => {
+          // A progress heartbeat can race the completion notify by a tick; a
+          // "running" arriving after the file finished must not undo it.
+          if (ev.status === "running" && pipeline().items[path]?.embed === "done") return;
+
+          if (ev.status === "done" || ev.status === "error") {
+            await setEmbedStatus(ev.subject_id, path, ev.status);
+          }
+          const touch = pipeline().touch;
+          switch (ev.status) {
+            case "queued":
+              touch(path, ev.subject_id, { parse: "done", embed: "queued" });
+              break;
+            case "running":
+              touch(path, ev.subject_id, {
+                parse: "done",
+                embed: "active",
+                embedPagesDone: ev.pages_done ?? 0,
+                embedTotalPages: ev.total_pages ?? 0,
+              });
+              // The settings page's bar is drawn from the run, and this is the
+              // only place the page inside the current document is known.
+              reportEmbedPages(path, ev.pages_done ?? 0, ev.total_pages ?? 0);
+              break;
+            case "done":
+              touch(path, ev.subject_id, {
+                parse: "done",
+                embed: "done",
+                embedPagesDone: ev.pages_done ?? 0,
+                embedTotalPages: ev.total_pages ?? 0,
+                embeddedAt: Date.now(),
+                error: undefined,
+                errorKind: undefined,
+                errorRetryable: undefined,
+                errorLatching: undefined,
+              });
+              break;
+            case "error":
+              touch(path, ev.subject_id, {
+                embed: "error",
+                error: ev.error ?? "Embedding failed",
+                errorKind: ev.kind,
+                errorRetryable: ev.retryable,
+                errorLatching: ev.latching,
+              });
+              break;
+          }
+
+        }, (message) => {
+          pipeline().touch(path, ev.subject_id, { embed: "error", error: message });
+          reportWriteFailure(message);
+        });
       }),
     );
     return () => {
